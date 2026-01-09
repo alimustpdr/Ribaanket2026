@@ -159,9 +159,16 @@ def extract_xlsx_to_csv(xlsx_path: Path, output_dir: Path) -> None:
                 for row in sheet.iter_rows(values_only=True):
                     # Convert row values to strings and handle None
                     row_data = [str(cell) if cell is not None else "" for cell in row]
-                    # Escape quotes and handle commas
-                    row_data = [f'"{cell}"' if ',' in cell or '"' in cell else cell for cell in row_data]
-                    f.write(",".join(row_data) + "\n")
+                    # Properly escape quotes and handle commas per RFC 4180
+                    escaped_data = []
+                    for cell in row_data:
+                        if ',' in cell or '"' in cell or '\n' in cell:
+                            # Double any quotes and wrap in quotes
+                            cell = cell.replace('"', '""')
+                            escaped_data.append(f'"{cell}"')
+                        else:
+                            escaped_data.append(cell)
+                    f.write(",".join(escaped_data) + "\n")
             
             print(f"    → Saved sheet '{sheet_name}' to: {csv_path}")
         
