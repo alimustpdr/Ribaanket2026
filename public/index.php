@@ -684,6 +684,11 @@ if ($path === '/panel/campaigns' && $method === 'GET') {
     }
     $schoolName = View::e((string)$school['name']);
 
+    $subWarn = '';
+    if (!hasActiveSubscription($pdo, (int)$ctx['school_id'])) {
+        $subWarn = '<p style="border:1px solid #c00; padding:8px;"><strong>Uyarı:</strong> Üyelik/paket aktif değil. Anket dönemi başlatamaz ve link üretemezsiniz. Ödeme/paket işlemini tamamlayın.</p>';
+    }
+
     $rows = $pdo->prepare('SELECT id, year, name, status, starts_at, ends_at, response_quota, created_at FROM campaigns WHERE school_id = :sid ORDER BY year DESC');
     $rows->execute([':sid' => $ctx['school_id']]);
     $campaigns = $rows->fetchAll();
@@ -711,6 +716,7 @@ if ($path === '/panel/campaigns' && $method === 'GET') {
     $html = View::layout('Anket Dönemleri', <<<HTML
 <h1>Anket Dönemleri</h1>
 <p><strong>Okul:</strong> {$schoolName}</p>
+{$subWarn}
 <p>Her yıl için ayrı anket dönemi oluşturulur. Linkler dönem aktifken çalışır; kota bitince otomatik kapanır.</p>
 <table border="1" cellpadding="6" cellspacing="0">
   <thead><tr><th>Yıl</th><th>Ad</th><th>Durum</th><th>Başlangıç</th><th>Bitiş</th><th>Kota</th><th></th></tr></thead>
@@ -2178,7 +2184,25 @@ if ($path === '/admin/login' && $method === 'POST') {
 if ($path === '/admin/schools' && $method === 'GET') {
     requireSiteAdmin();
     $pdo = Db::pdo();
-    $rows = $pdo->query('SELECT id, name, city, district, school_type, status, created_at FROM schools ORDER BY created_at DESC')->fetchAll();
+    // Okul + (en güncel) üyelik bilgisi
+    $rows = $pdo->query('
+        SELECT
+          s.id, s.name, s.city, s.district, s.school_type, s.status, s.created_at,
+          ss.status AS sub_status,
+          ss.annual_quota AS sub_quota,
+          qp.name AS sub_package_name
+        FROM schools s
+        LEFT JOIN school_subscriptions ss
+          ON ss.id = (
+            SELECT ss2.id
+            FROM school_subscriptions ss2
+            WHERE ss2.school_id = s.id
+            ORDER BY ss2.created_at DESC
+            LIMIT 1
+          )
+        LEFT JOIN quota_packages qp ON qp.id = ss.package_id
+        ORDER BY s.created_at DESC
+    ')->fetchAll();
 
     $csrf = Csrf::input();
     $items = '';
@@ -2191,6 +2215,15 @@ if ($path === '/admin/schools' && $method === 'GET') {
         $items .= '<td>' . View::e((string)$r['district']) . '</td>';
         $items .= '<td>' . View::e((string)$r['school_type']) . '</td>';
         $items .= '<td>' . View::e((string)$r['status']) . '</td>';
+        $items .= '<td>' . View::e((string)($r['sub_status'] ?? '')) . '</td>';
+        $pkg = '';
+        if (!empty($r['sub_package_name'])) {
+            $pkg = (string)$r['sub_package_name'];
+            if (!empty($r['sub_quota'])) {
+                $pkg .= ' (' . (int)$r['sub_quota'] . ')';
+            }
+        }
+        $items .= '<td>' . View::e($pkg) . '</td>';
         $items .= '<td>' . View::e((string)$r['created_at']) . '</td>';
         $items .= '<td>';
         if ((string)$r['status'] === 'pending') {
@@ -2210,7 +2243,7 @@ if ($path === '/admin/schools' && $method === 'GET') {
 <table border="1" cellpadding="6" cellspacing="0">
   <thead>
     <tr>
-      <th>ID</th><th>Okul</th><th>İl</th><th>İlçe</th><th>Tür</th><th>Durum</th><th>Başvuru</th><th>İşlem</th>
+      <th>ID</th><th>Okul</th><th>İl</th><th>İlçe</th><th>Tür</th><th>Okul durumu</th><th>Üyelik durumu</th><th>Paket</th><th>Başvuru</th><th>İşlem</th>
     </tr>
   </thead>
   <tbody>
