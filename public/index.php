@@ -334,14 +334,16 @@ if ($path === '/apply' && $method === 'POST') {
 
         // Üyelik (ilk paket) siparişi: pending
         $stmt3 = $pdo->prepare('
-            INSERT INTO school_subscriptions (school_id, package_id, status, annual_quota)
-            VALUES (:sid, :pid, :st, :q)
+            INSERT INTO school_subscriptions (school_id, package_id, method, status, annual_quota, note)
+            VALUES (:sid, :pid, :m, :st, :q, :note)
         ');
         $stmt3->execute([
             ':sid' => $schoolId,
             ':pid' => $packageId,
+            ':m' => null,
             ':st' => 'pending',
             ':q' => $annualQuota,
+            ':note' => null,
         ]);
 
         $pdo->commit();
@@ -452,6 +454,7 @@ if ($path === '/panel' && $method === 'GET') {
 <ul>
   <li><a href="/panel/classes">Sınıflar</a></li>
   <li><a href="/panel/subscription">Üyelik / Paket</a></li>
+  <li><a href="/panel/orders">Siparişlerim</a></li>
   <li><a href="/panel/campaigns">Anket Dönemleri</a></li>
   <li><a href="/panel/reports">Raporlar</a></li>
 </ul>
@@ -557,14 +560,16 @@ if ($path === '/panel/subscription/order' && $method === 'POST') {
 
     // Yeni üyelik kaydı (pending). Eski varsa dokunmuyoruz; admin onayladığında aktif edeceğiz.
     $stmt = $pdo->prepare('
-        INSERT INTO school_subscriptions (school_id, package_id, status, annual_quota)
-        VALUES (:sid, :pid, :st, :q)
+        INSERT INTO school_subscriptions (school_id, package_id, method, status, annual_quota, note)
+        VALUES (:sid, :pid, :m, :st, :q, :note)
     ');
     $stmt->execute([
         ':sid' => (int)$ctx['school_id'],
         ':pid' => $packageId,
+        ':m' => $methodVal,
         ':st' => 'pending',
         ':q' => $annualQuota,
+        ':note' => ($note === '' ? null : $note),
     ]);
 
     // Notu kaybetmemek için en basit: quota_orders'a da bir talep kaydı düşelim (kampanyasız değil, bu yüzden sadece log amaçlı kullanmıyoruz).
@@ -574,6 +579,90 @@ if ($path === '/panel/subscription/order' && $method === 'POST') {
 <h1>Üyelik siparişi oluşturuldu</h1>
 <p>Ödeme/tahsilat sonrası site yöneticisi onaylayınca paketiniz aktif olur.</p>
 <p><a href="/panel/subscription">Üyelik sayfasına dön</a></p>
+HTML);
+    Http::html(200, $html);
+    exit;
+}
+
+// -------------------------
+// Okul Paneli: Siparişlerim (üyelik + ek kota)
+// -------------------------
+if ($path === '/panel/orders' && $method === 'GET') {
+    $ctx = requireSchoolAdmin();
+    $pdo = Db::pdo();
+
+    $schoolStmt = $pdo->prepare('SELECT id, name FROM schools WHERE id = :id LIMIT 1');
+    $schoolStmt->execute([':id' => $ctx['school_id']]);
+    $school = $schoolStmt->fetch();
+    if (!$school) {
+        Http::notFound();
+        exit;
+    }
+    $schoolName = View::e((string)$school['name']);
+
+    $subs = $pdo->prepare('
+        SELECT ss.id, ss.status, ss.method, ss.annual_quota, ss.note, ss.created_at, ss.paid_at, ss.starts_at, ss.ends_at,
+               p.name AS pkg_name
+        FROM school_subscriptions ss
+        JOIN quota_packages p ON p.id = ss.package_id
+        WHERE ss.school_id = :sid
+        ORDER BY ss.created_at DESC
+        LIMIT 50
+    ');
+    $subs->execute([':sid' => $ctx['school_id']]);
+    $subRows = '';
+    foreach ($subs->fetchAll() as $r) {
+        $subRows .= '<tr>';
+        $subRows .= '<td>' . View::e((string)$r['id']) . '</td>';
+        $subRows .= '<td>' . View::e((string)$r['pkg_name']) . ' (+' . View::e((string)$r['annual_quota']) . ')</td>';
+        $subRows .= '<td>' . View::e((string)($r['method'] ?? '')) . '</td>';
+        $subRows .= '<td>' . View::e((string)$r['status']) . '</td>';
+        $subRows .= '<td>' . View::e((string)($r['note'] ?? '')) . '</td>';
+        $subRows .= '<td>' . View::e((string)$r['created_at']) . '</td>';
+        $subRows .= '<td>' . View::e((string)($r['paid_at'] ?? '')) . '</td>';
+        $subRows .= '</tr>';
+    }
+
+    $orders = $pdo->prepare('
+        SELECT o.id, o.status, o.method, o.quota_add, o.note, o.created_at, o.paid_at,
+               c.year AS camp_year, c.name AS camp_name,
+               p.name AS pkg_name
+        FROM quota_orders o
+        JOIN campaigns c ON c.id = o.campaign_id
+        JOIN quota_packages p ON p.id = o.package_id
+        WHERE o.school_id = :sid
+        ORDER BY o.created_at DESC
+        LIMIT 100
+    ');
+    $orders->execute([':sid' => $ctx['school_id']]);
+    $orderRows = '';
+    foreach ($orders->fetchAll() as $r) {
+        $orderRows .= '<tr>';
+        $orderRows .= '<td>' . View::e((string)$r['id']) . '</td>';
+        $orderRows .= '<td>' . View::e((string)$r['camp_year']) . ' - ' . View::e((string)$r['camp_name']) . '</td>';
+        $orderRows .= '<td>' . View::e((string)$r['pkg_name']) . ' (+' . View::e((string)$r['quota_add']) . ')</td>';
+        $orderRows .= '<td>' . View::e((string)$r['method']) . '</td>';
+        $orderRows .= '<td>' . View::e((string)$r['status']) . '</td>';
+        $orderRows .= '<td>' . View::e((string)($r['note'] ?? '')) . '</td>';
+        $orderRows .= '<td>' . View::e((string)$r['created_at']) . '</td>';
+        $orderRows .= '<td>' . View::e((string)($r['paid_at'] ?? '')) . '</td>';
+        $orderRows .= '</tr>';
+    }
+
+    $html = View::layout('Siparişlerim', <<<HTML
+<h1>Siparişlerim</h1>
+<p><strong>Okul:</strong> {$schoolName}</p>
+<h2>Üyelik / Paket siparişleri</h2>
+<table border="1" cellpadding="6" cellspacing="0">
+  <thead><tr><th>ID</th><th>Paket</th><th>Yöntem</th><th>Durum</th><th>Not</th><th>Oluşturma</th><th>Ödeme</th></tr></thead>
+  <tbody>{$subRows}</tbody>
+</table>
+<h2>Ek kota siparişleri</h2>
+<table border="1" cellpadding="6" cellspacing="0">
+  <thead><tr><th>ID</th><th>Dönem</th><th>Paket</th><th>Yöntem</th><th>Durum</th><th>Not</th><th>Oluşturma</th><th>Ödeme</th></tr></thead>
+  <tbody>{$orderRows}</tbody>
+</table>
+<p><a href="/panel">Geri</a></p>
 HTML);
     Http::html(200, $html);
     exit;
@@ -2113,6 +2202,11 @@ if ($path === '/admin/schools' && $method === 'GET') {
 
     $html = View::layout('Okullar', <<<HTML
 <h1>Okullar</h1>
+<p>
+  <a href="/admin/subscriptions">Üyelik onayları</a> |
+  <a href="/admin/packages">Paketler</a> |
+  <a href="/admin/orders">Ek kota siparişleri</a>
+</p>
 <table border="1" cellpadding="6" cellspacing="0">
   <thead>
     <tr>
@@ -2166,6 +2260,11 @@ if ($path === '/admin/packages' && $method === 'GET') {
 
     $html = View::layout('Paketler', <<<HTML
 <h1>Ek Kota Paketleri</h1>
+<p>
+  <a href="/admin/subscriptions">Üyelik onayları</a> |
+  <a href="/admin/schools">Okullar</a> |
+  <a href="/admin/orders">Ek kota siparişleri</a>
+</p>
 <table border="1" cellpadding="6" cellspacing="0">
   <thead><tr><th>ID</th><th>Ad</th><th>Kota</th><th>Fiyat</th><th>Durum</th><th>Oluşturma</th></tr></thead>
   <tbody>{$items}</tbody>
@@ -2241,7 +2340,11 @@ if ($path === '/admin/orders' && $method === 'GET') {
 
     $html = View::layout('Siparişler', <<<HTML
 <h1>Ek Kota Siparişleri</h1>
-<p><a href="/admin/packages">Paketler</a></p>
+<p>
+  <a href="/admin/subscriptions">Üyelik onayları</a> |
+  <a href="/admin/schools">Okullar</a> |
+  <a href="/admin/packages">Paketler</a>
+</p>
 <table border="1" cellpadding="6" cellspacing="0">
   <thead><tr><th>ID</th><th>Okul</th><th>Dönem</th><th>Paket</th><th>Yöntem</th><th>Durum</th><th>Not</th><th>Oluşturma</th><th>İşlem</th></tr></thead>
   <tbody>{$items}</tbody>
@@ -2333,7 +2436,11 @@ if ($path === '/admin/subscriptions' && $method === 'GET') {
     }
     $html = View::layout('Üyelikler', <<<HTML
 <h1>Üyelik / Paket Onayları</h1>
-<p><a href="/admin/packages">Paketler</a> | <a href="/admin/orders">Ek kota siparişleri</a></p>
+<p>
+  <a href="/admin/schools">Okullar</a> |
+  <a href="/admin/packages">Paketler</a> |
+  <a href="/admin/orders">Ek kota siparişleri</a>
+</p>
 <table border="1" cellpadding="6" cellspacing="0">
   <thead><tr><th>ID</th><th>Okul</th><th>Paket</th><th>Durum</th><th>Oluşturma</th><th>Ödeme</th><th>İşlem</th></tr></thead>
   <tbody>{$items}</tbody>
