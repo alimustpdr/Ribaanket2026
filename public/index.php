@@ -2739,4 +2739,203 @@ if ($path === '/admin/subscriptions/mark-paid' && $method === 'POST') {
     redirect('/admin/subscriptions');
 }
 
+// -------------------------
+// Site yöneticisi: Demo veri (test için)
+// -------------------------
+if ($path === '/admin/demo' && $method === 'GET') {
+    requireSiteAdmin();
+    $csrf = Csrf::input();
+    $html = View::layout('Demo Veri', <<<HTML
+<h1>Demo Veri Oluştur</h1>
+<p>Bu araç test amaçlıdır: demo okul + aktif üyelik + aktif anket dönemi + sınıflar + rastgele yanıtlar oluşturur.</p>
+<form method="post" action="/admin/demo/create">
+  {$csrf}
+  <button type="submit">Demo veriyi oluştur</button>
+</form>
+<p><a href="/admin/schools">Okullar</a></p>
+HTML);
+    Http::html(200, $html);
+    exit;
+}
+
+if ($path === '/admin/demo/create' && $method === 'POST') {
+    requireSiteAdmin();
+    Csrf::validatePost();
+    $pdo = Db::pdo();
+
+    // Demo ayarları (test etmeye yetecek düzeyde)
+    $schoolType = 'ilkokul';
+    $classCount = 3;
+    $responsesPerClass = [
+        'ogrenci' => 30,
+        'veli' => 30,
+        'ogretmen' => 10,
+    ];
+    $year = (int)date('Y');
+
+    // Paket kontrol: en yüksek kotayı seç
+    $pkg = $pdo->query('SELECT id, name, quota_add FROM quota_packages WHERE active = 1 ORDER BY quota_add DESC LIMIT 1')->fetch();
+    if (!$pkg) {
+        Http::text(500, "Demo oluşturmak için önce en az 1 aktif paket tanımlayın: /admin/packages\n");
+        exit;
+    }
+    $packageId = (int)$pkg['id'];
+    $annualQuota = max(2000, (int)$pkg['quota_add']);
+
+    $demoSuffix = date('Ymd_His');
+    $schoolName = 'Demo İlkokul ' . $demoSuffix;
+    $city = 'Demo';
+    $district = 'Demo';
+    $adminEmail = 'demo+' . $demoSuffix . '@example.com';
+    $adminPasswordPlain = bin2hex(random_bytes(4)); // 8 hex
+    $adminPasswordHash = password_hash($adminPasswordPlain, PASSWORD_DEFAULT);
+
+    $pdo->beginTransaction();
+    try {
+        // school (aktif)
+        $pdo->prepare('INSERT INTO schools (name, city, district, school_type, status) VALUES (:n, :c, :d, :t, :s)')
+            ->execute([
+                ':n' => $schoolName,
+                ':c' => $city,
+                ':d' => $district,
+                ':t' => $schoolType,
+                ':s' => 'active',
+            ]);
+        $schoolId = (int)$pdo->lastInsertId();
+
+        // admin
+        $pdo->prepare('INSERT INTO school_admins (school_id, email, password_hash) VALUES (:sid, :email, :ph)')
+            ->execute([
+                ':sid' => $schoolId,
+                ':email' => $adminEmail,
+                ':ph' => $adminPasswordHash,
+            ]);
+
+        // subscription (aktif)
+        $pdo->prepare('
+            INSERT INTO school_subscriptions (school_id, package_id, method, status, annual_quota, note, paid_at, starts_at, ends_at)
+            VALUES (:sid, :pid, :m, :st, :q, :note, NOW(), NOW(), DATE_ADD(NOW(), INTERVAL 1 YEAR))
+        ')->execute([
+            ':sid' => $schoolId,
+            ':pid' => $packageId,
+            ':m' => 'manual',
+            ':st' => 'active',
+            ':q' => $annualQuota,
+            ':note' => 'demo',
+        ]);
+
+        // campaign (aktif)
+        $campName = 'Demo Anket Dönemi ' . $year;
+        $startsAt = date('Y-m-d H:i:s', time() - 3600 * 24);
+        $endsAt = date('Y-m-d H:i:s', time() + 3600 * 24 * 30);
+        $pdo->prepare('
+            INSERT INTO campaigns (school_id, year, name, status, starts_at, ends_at, response_quota, activated_at)
+            VALUES (:sid, :y, :n, :st, :sa, :ea, :q, NOW())
+        ')->execute([
+            ':sid' => $schoolId,
+            ':y' => $year,
+            ':n' => $campName,
+            ':st' => 'active',
+            ':sa' => $startsAt,
+            ':ea' => $endsAt,
+            ':q' => $annualQuota,
+        ]);
+        $campaignId = (int)$pdo->lastInsertId();
+
+        // classes + form instances
+        $classIds = [];
+        for ($i = 1; $i <= $classCount; $i++) {
+            $className = 'Demo ' . ($i) . 'A';
+            $pdo->prepare('INSERT INTO classes (school_id, name) VALUES (:sid, :n)')
+                ->execute([':sid' => $schoolId, ':n' => $className]);
+            $classId = (int)$pdo->lastInsertId();
+            $classIds[] = ['id' => $classId, 'name' => $className];
+
+            foreach (allowedAudiences($schoolType) as $aud) {
+                $pid = bin2hex(random_bytes(16));
+                $pdo->prepare('
+                    INSERT INTO form_instances (school_id, campaign_id, class_id, audience, public_id, status)
+                    VALUES (:sid, :camp, :cid, :aud, :pid, :st)
+                ')->execute([
+                    ':sid' => $schoolId,
+                    ':camp' => $campaignId,
+                    ':cid' => $classId,
+                    ':aud' => $aud,
+                    ':pid' => $pid,
+                    ':st' => 'active',
+                ]);
+            }
+        }
+
+        // responses
+        $formsStmt = $pdo->prepare('SELECT id, class_id, audience, public_id FROM form_instances WHERE school_id = :sid AND campaign_id = :cid');
+        $formsStmt->execute([':sid' => $schoolId, ':cid' => $campaignId]);
+        $forms = $formsStmt->fetchAll();
+
+        $insResp = $pdo->prepare('
+            INSERT INTO responses (school_id, campaign_id, class_id, form_instance_id, gender, ip_hash, user_agent)
+            VALUES (:sid, :camp, :cid, :fid, :g, :ip, :ua)
+        ');
+        $insAns = $pdo->prepare('INSERT INTO response_answers (response_id, item_no, choice) VALUES (:rid, :no, :ch)');
+
+        foreach ($forms as $f) {
+            $formId = (int)$f['id'];
+            $classId = (int)$f['class_id'];
+            $aud = (string)$f['audience'];
+            $publicId = (string)$f['public_id'];
+
+            $count = $responsesPerClass[$aud] ?? 0;
+            if ($count <= 0) {
+                continue;
+            }
+
+            $spec = formSpec($schoolType, $aud);
+            if ($spec === null) {
+                continue;
+            }
+            $itemCount = (int)$spec['items'];
+
+            for ($r = 0; $r < $count; $r++) {
+                $gender = (random_int(0, 1) === 0) ? 'K' : 'E';
+                $iphash = hash('sha256', $publicId . '|' . bin2hex(random_bytes(16)));
+                $insResp->execute([
+                    ':sid' => $schoolId,
+                    ':camp' => $campaignId,
+                    ':cid' => $classId,
+                    ':fid' => $formId,
+                    ':g' => $gender,
+                    ':ip' => $iphash,
+                    ':ua' => 'demo-generator',
+                ]);
+                $responseId = (int)$pdo->lastInsertId();
+
+                for ($i = 1; $i <= $itemCount; $i++) {
+                    $ch = (random_int(0, 1) === 0) ? 'A' : 'B';
+                    $insAns->execute([':rid' => $responseId, ':no' => $i, ':ch' => $ch]);
+                }
+            }
+        }
+
+        $pdo->commit();
+    } catch (\Throwable $e) {
+        $pdo->rollBack();
+        Http::text(500, "Demo veri oluşturulamadı.\n");
+        exit;
+    }
+
+    $schoolNameE = View::e($schoolName);
+    $adminEmailE = View::e($adminEmail);
+    $adminPassE = View::e($adminPasswordPlain);
+    $html = View::layout('Demo Oluşturuldu', <<<HTML
+<h1>Demo veri oluşturuldu</h1>
+<p><strong>Okul:</strong> {$schoolNameE}</p>
+<p><strong>Okul admin e-posta:</strong> {$adminEmailE}</p>
+<p><strong>Okul admin şifre:</strong> <code>{$adminPassE}</code></p>
+<p><a href="/login">Okul paneline giriş</a></p>
+<p><a href="/admin/schools">Okullar</a></p>
+HTML);
+    Http::html(200, $html);
+    exit;
+}
+
 Http::notFound();
