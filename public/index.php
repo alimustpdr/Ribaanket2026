@@ -34,6 +34,23 @@ function requireSchoolAdmin(): array {
     ];
 }
 
+function activeSubscription(\PDO $pdo, int $schoolId): ?array {
+    $stmt = $pdo->prepare('
+        SELECT ss.*
+        FROM school_subscriptions ss
+        WHERE ss.school_id = :sid AND ss.status = :st AND (ss.ends_at IS NULL OR ss.ends_at > NOW())
+        ORDER BY ss.created_at DESC
+        LIMIT 1
+    ');
+    $stmt->execute([':sid' => $schoolId, ':st' => 'active']);
+    $row = $stmt->fetch();
+    return $row ?: null;
+}
+
+function hasActiveSubscription(\PDO $pdo, int $schoolId): bool {
+    return activeSubscription($pdo, $schoolId) !== null;
+}
+
 function requireSiteAdmin(): void {
     if (empty($_SESSION['site_admin'])) {
         redirect('/admin/login');
@@ -223,6 +240,17 @@ HTML);
 // Okul başvurusu
 // -------------------------
 if ($path === '/apply' && $method === 'GET') {
+    $pdo = Db::pdo();
+    $packages = $pdo->query('SELECT id, name, quota_add, price_amount, price_currency FROM quota_packages WHERE active = 1 ORDER BY quota_add ASC')->fetchAll();
+    $pkgOptions = '';
+    foreach ($packages as $p) {
+        $id = (int)$p['id'];
+        $label = (string)$p['name'] . ' (' . (int)$p['quota_add'] . ' yıllık toplam yanıt)';
+        if (!empty($p['price_amount']) && !empty($p['price_currency'])) {
+            $label .= ' - ' . (int)$p['price_amount'] . ' ' . (string)$p['price_currency'];
+        }
+        $pkgOptions .= '<option value="' . $id . '">' . View::e($label) . '</option>';
+    }
     $csrf = Csrf::input();
     $html = View::layout('Okul Başvurusu', <<<HTML
 <h1>Okul Başvurusu</h1>
@@ -237,6 +265,11 @@ if ($path === '/apply' && $method === 'GET') {
       <option value="ilkokul">İlkokul</option>
       <option value="ortaokul">Ortaokul</option>
       <option value="lise">Lise</option>
+    </select>
+  </label></p>
+  <p><label>Yıllık başlangıç paketi<br />
+    <select name="package_id" required>
+      {$pkgOptions}
     </select>
   </label></p>
   <hr />
@@ -257,11 +290,12 @@ if ($path === '/apply' && $method === 'POST') {
     $city = trim((string)($_POST['city'] ?? ''));
     $district = trim((string)($_POST['district'] ?? ''));
     $schoolType = (string)($_POST['school_type'] ?? '');
+    $packageId = (int)($_POST['package_id'] ?? 0);
     $adminEmail = trim((string)($_POST['admin_email'] ?? ''));
     $adminPassword = (string)($_POST['admin_password'] ?? '');
 
     $allowedTypes = ['okul_oncesi', 'ilkokul', 'ortaokul', 'lise'];
-    if ($schoolName === '' || $city === '' || $district === '' || !in_array($schoolType, $allowedTypes, true) || $adminEmail === '' || $adminPassword === '') {
+    if ($schoolName === '' || $city === '' || $district === '' || !in_array($schoolType, $allowedTypes, true) || $packageId <= 0 || $adminEmail === '' || $adminPassword === '') {
         Http::text(400, "Eksik/yanlış bilgi.\n");
         exit;
     }
@@ -269,6 +303,17 @@ if ($path === '/apply' && $method === 'POST') {
     $pdo = Db::pdo();
     $pdo->beginTransaction();
     try {
+        // paket doğrula
+        $pkgStmt = $pdo->prepare('SELECT id, quota_add, active FROM quota_packages WHERE id = :id LIMIT 1');
+        $pkgStmt->execute([':id' => $packageId]);
+        $pkg = $pkgStmt->fetch();
+        if (!$pkg || (int)$pkg['active'] !== 1) {
+            $pdo->rollBack();
+            Http::text(400, "Seçilen paket aktif değil.\n");
+            exit;
+        }
+        $annualQuota = (int)$pkg['quota_add'];
+
         $stmt = $pdo->prepare('INSERT INTO schools (name, city, district, school_type, status) VALUES (:name, :city, :district, :type, :status)');
         $stmt->execute([
             ':name' => $schoolName,
@@ -287,6 +332,18 @@ if ($path === '/apply' && $method === 'POST') {
             ':password_hash' => $hash,
         ]);
 
+        // Üyelik (ilk paket) siparişi: pending
+        $stmt3 = $pdo->prepare('
+            INSERT INTO school_subscriptions (school_id, package_id, status, annual_quota)
+            VALUES (:sid, :pid, :st, :q)
+        ');
+        $stmt3->execute([
+            ':sid' => $schoolId,
+            ':pid' => $packageId,
+            ':st' => 'pending',
+            ':q' => $annualQuota,
+        ]);
+
         $pdo->commit();
     } catch (\Throwable $e) {
         $pdo->rollBack();
@@ -297,6 +354,7 @@ if ($path === '/apply' && $method === 'POST') {
     $html = View::layout('Başvuru alındı', <<<HTML
 <h1>Başvurunuz alındı</h1>
 <p>Okul hesabınız site yöneticisi tarafından onaylandıktan sonra giriş yapabilirsiniz.</p>
+<p><strong>Not:</strong> Üyelik paketi ödenene kadar anket dönemi başlatamaz ve link üretemezsiniz.</p>
 <p><a href="/login">Okul paneli girişi</a></p>
 <p><a href="/">Ana sayfa</a></p>
 HTML);
@@ -381,16 +439,141 @@ if ($path === '/panel' && $method === 'GET') {
     $name = View::e((string)$school['name']);
     $type = View::e((string)$school['school_type']);
 
+    $subWarn = '';
+    if (!hasActiveSubscription($pdo, (int)$ctx['school_id'])) {
+        $subWarn = '<p style="border:1px solid #c00; padding:8px;"><strong>Uyarı:</strong> Üyelik/paket aktif değil. Anket dönemi başlatamaz ve link üretemezsiniz. Lütfen ödeme/paket işlemini tamamlayın.</p>';
+    }
+
     $html = View::layout('Okul Paneli', <<<HTML
 <h1>Okul Paneli</h1>
+{$subWarn}
 <p><strong>Okul:</strong> {$name}</p>
 <p><strong>Tür:</strong> {$type}</p>
 <ul>
   <li><a href="/panel/classes">Sınıflar</a></li>
+  <li><a href="/panel/subscription">Üyelik / Paket</a></li>
   <li><a href="/panel/campaigns">Anket Dönemleri</a></li>
   <li><a href="/panel/reports">Raporlar</a></li>
 </ul>
 <form method="post" action="/logout">{$csrf}<button type="submit">Çıkış</button></form>
+HTML);
+    Http::html(200, $html);
+    exit;
+}
+
+// -------------------------
+// Okul Paneli: Üyelik / Paket (başlangıç paketi + durum)
+// -------------------------
+if ($path === '/panel/subscription' && $method === 'GET') {
+    $ctx = requireSchoolAdmin();
+    $pdo = Db::pdo();
+
+    $schoolStmt = $pdo->prepare('SELECT id, name FROM schools WHERE id = :id LIMIT 1');
+    $schoolStmt->execute([':id' => $ctx['school_id']]);
+    $school = $schoolStmt->fetch();
+    if (!$school) {
+        Http::notFound();
+        exit;
+    }
+
+    $subStmt = $pdo->prepare('
+        SELECT ss.*, p.name AS pkg_name
+        FROM school_subscriptions ss
+        JOIN quota_packages p ON p.id = ss.package_id
+        WHERE ss.school_id = :sid
+        ORDER BY ss.created_at DESC
+        LIMIT 1
+    ');
+    $subStmt->execute([':sid' => $ctx['school_id']]);
+    $sub = $subStmt->fetch();
+
+    $status = $sub ? (string)$sub['status'] : 'none';
+    $pkgName = $sub ? View::e((string)$sub['pkg_name']) : '-';
+    $annualQuota = $sub ? (int)$sub['annual_quota'] : 0;
+    $starts = $sub ? View::e((string)($sub['starts_at'] ?? '')) : '';
+    $ends = $sub ? View::e((string)($sub['ends_at'] ?? '')) : '';
+
+    $packages = listActiveQuotaPackages($pdo);
+    $pkgOptions = '';
+    foreach ($packages as $p) {
+        $id = (int)$p['id'];
+        $label = (string)$p['name'] . ' (' . (int)$p['quota_add'] . ' yıllık toplam yanıt)';
+        if (!empty($p['price_amount']) && !empty($p['price_currency'])) {
+            $label .= ' - ' . (int)$p['price_amount'] . ' ' . (string)$p['price_currency'];
+        }
+        $pkgOptions .= '<option value="' . $id . '">' . View::e($label) . '</option>';
+    }
+
+    $csrf = Csrf::input();
+    $html = View::layout('Üyelik / Paket', <<<HTML
+<h1>Üyelik / Paket</h1>
+<p><strong>Durum:</strong> {$status}</p>
+<p><strong>Paket:</strong> {$pkgName}</p>
+<p><strong>Yıllık kota:</strong> {$annualQuota}</p>
+<p><strong>Başlangıç:</strong> {$starts}</p>
+<p><strong>Bitiş:</strong> {$ends}</p>
+<hr />
+<h2>Paket satın alma / ödeme bildirimi</h2>
+<p>Ödeme altyapısı olmadığı için burada sipariş kaydı oluşturulur; ödeme sonrası site yöneticisi onaylayınca paket aktif olur.</p>
+<form method="post" action="/panel/subscription/order">
+  {$csrf}
+  <p><label>Paket<br />
+    <select name="package_id" required>{$pkgOptions}</select>
+  </label></p>
+  <p><label>Yöntem<br />
+    <select name="method" required>
+      <option value="online">Online (kullanıcı kendi alır)</option>
+      <option value="manual">Nakit / yönetici tanımlasın</option>
+    </select>
+  </label></p>
+  <p><label>Not (opsiyonel)<br /><input name="note" /></label></p>
+  <p><button type="submit">Sipariş oluştur</button></p>
+</form>
+<p><a href="/panel">Geri</a></p>
+HTML);
+    Http::html(200, $html);
+    exit;
+}
+
+if ($path === '/panel/subscription/order' && $method === 'POST') {
+    $ctx = requireSchoolAdmin();
+    Csrf::validatePost();
+    $pdo = Db::pdo();
+    $packageId = (int)($_POST['package_id'] ?? 0);
+    $methodVal = (string)($_POST['method'] ?? '');
+    $note = trim((string)($_POST['note'] ?? ''));
+    if ($packageId <= 0 || ($methodVal !== 'online' && $methodVal !== 'manual')) {
+        Http::badRequest("Eksik/yanlış bilgi.\n");
+        exit;
+    }
+    $pkgStmt = $pdo->prepare('SELECT id, quota_add, active FROM quota_packages WHERE id = :id LIMIT 1');
+    $pkgStmt->execute([':id' => $packageId]);
+    $pkg = $pkgStmt->fetch();
+    if (!$pkg || (int)$pkg['active'] !== 1) {
+        Http::badRequest("Paket bulunamadı/aktif değil.\n");
+        exit;
+    }
+    $annualQuota = (int)$pkg['quota_add'];
+
+    // Yeni üyelik kaydı (pending). Eski varsa dokunmuyoruz; admin onayladığında aktif edeceğiz.
+    $stmt = $pdo->prepare('
+        INSERT INTO school_subscriptions (school_id, package_id, status, annual_quota)
+        VALUES (:sid, :pid, :st, :q)
+    ');
+    $stmt->execute([
+        ':sid' => (int)$ctx['school_id'],
+        ':pid' => $packageId,
+        ':st' => 'pending',
+        ':q' => $annualQuota,
+    ]);
+
+    // Notu kaybetmemek için en basit: quota_orders'a da bir talep kaydı düşelim (kampanyasız değil, bu yüzden sadece log amaçlı kullanmıyoruz).
+    // Şimdilik not sadece üyelik tablosunda yok; isterseniz subscription_orders eklenebilir.
+
+    $html = View::layout('Sipariş alındı', <<<HTML
+<h1>Üyelik siparişi oluşturuldu</h1>
+<p>Ödeme/tahsilat sonrası site yöneticisi onaylayınca paketiniz aktif olur.</p>
+<p><a href="/panel/subscription">Üyelik sayfasına dön</a></p>
 HTML);
     Http::html(200, $html);
     exit;
@@ -464,18 +647,31 @@ HTML);
 if ($path === '/panel/campaigns/create' && $method === 'POST') {
     $ctx = requireSchoolAdmin();
     Csrf::validatePost();
+    $pdo = Db::pdo();
+    if (!hasActiveSubscription($pdo, (int)$ctx['school_id'])) {
+        Http::forbidden("Üyelik/paket aktif değil. Anket dönemi oluşturamazsınız.\n");
+        exit;
+    }
     $year = (int)($_POST['year'] ?? 0);
     $name = trim((string)($_POST['name'] ?? ''));
     $startsAt = (string)($_POST['starts_at'] ?? '');
     $endsAt = (string)($_POST['ends_at'] ?? '');
-    $quota = (int)($_POST['response_quota'] ?? 0);
 
-    if ($year <= 0 || $name === '' || $startsAt === '' || $endsAt === '' || $quota <= 0) {
+    if ($year <= 0 || $name === '' || $startsAt === '' || $endsAt === '') {
         Http::badRequest("Eksik/yanlış bilgi.\n");
         exit;
     }
 
-    $pdo = Db::pdo();
+    $sub = activeSubscription($pdo, (int)$ctx['school_id']);
+    if (!$sub) {
+        Http::forbidden("Üyelik/paket aktif değil.\n");
+        exit;
+    }
+    $quota = (int)$sub['annual_quota'];
+    if ($quota <= 0) {
+        Http::text(500, "Üyelik kotası geçersiz.\n");
+        exit;
+    }
     try {
         $stmt = $pdo->prepare('
             INSERT INTO campaigns (school_id, year, name, status, starts_at, ends_at, response_quota)
@@ -544,7 +740,7 @@ if (preg_match('#^/panel/campaigns/(\\d+)$#', $path, $m) && $method === 'GET') {
   {$csrf}
   <p><label>Başlangıç<br /><input type="datetime-local" name="starts_at" value="{$startsVal}" required /></label></p>
   <p><label>Bitiş<br /><input type="datetime-local" name="ends_at" value="{$endsVal}" required /></label></p>
-  <p><label>Kota<br /><input type="number" name="response_quota" value="{$quotaVal}" required /></label></p>
+  <p><strong>Kota:</strong> {$quotaVal} (Kota artırma: “Ek kota” ekranından yapılır)</p>
   <p><button type="submit">Güncelle</button></p>
 </form>
 HTML;
@@ -572,6 +768,10 @@ if (preg_match('#^/panel/campaigns/(\\d+)/activate$#', $path, $m) && $method ===
     Csrf::validatePost();
     $campaignId = (int)$m[1];
     $pdo = Db::pdo();
+    if (!hasActiveSubscription($pdo, (int)$ctx['school_id'])) {
+        Http::forbidden("Üyelik/paket aktif değil. Anket dönemi başlatamazsınız.\n");
+        exit;
+    }
 
     $pdo->beginTransaction();
     try {
@@ -678,21 +878,19 @@ if (preg_match('#^/panel/campaigns/(\\d+)/update$#', $path, $m) && $method === '
     $campaignId = (int)$m[1];
     $startsAt = (string)($_POST['starts_at'] ?? '');
     $endsAt = (string)($_POST['ends_at'] ?? '');
-    $quota = (int)($_POST['response_quota'] ?? 0);
-    if ($startsAt === '' || $endsAt === '' || $quota <= 0) {
+    if ($startsAt === '' || $endsAt === '') {
         Http::badRequest("Eksik/yanlış bilgi.\n");
         exit;
     }
     $pdo = Db::pdo();
     $stmt = $pdo->prepare('
         UPDATE campaigns
-        SET starts_at = :starts_at, ends_at = :ends_at, response_quota = :quota
+        SET starts_at = :starts_at, ends_at = :ends_at
         WHERE id = :id AND school_id = :sid
     ');
     $stmt->execute([
         ':starts_at' => str_replace('T', ' ', $startsAt) . ':00',
         ':ends_at' => str_replace('T', ' ', $endsAt) . ':00',
-        ':quota' => $quota,
         ':id' => $campaignId,
         ':sid' => $ctx['school_id'],
     ]);
@@ -704,6 +902,10 @@ if (preg_match('#^/panel/campaigns/(\\d+)/reopen$#', $path, $m) && $method === '
     Csrf::validatePost();
     $campaignId = (int)$m[1];
     $pdo = Db::pdo();
+    if (!hasActiveSubscription($pdo, (int)$ctx['school_id'])) {
+        Http::forbidden("Üyelik/paket aktif değil. Anket dönemi yeniden başlatamazsınız.\n");
+        exit;
+    }
 
     $pdo->beginTransaction();
     try {
@@ -2093,6 +2295,96 @@ if ($path === '/admin/orders/mark-paid' && $method === 'POST') {
     }
 
     redirect('/admin/orders');
+}
+
+// -------------------------
+// Site yöneticisi: Üyelik onayları (ilk paket)
+// -------------------------
+if ($path === '/admin/subscriptions' && $method === 'GET') {
+    requireSiteAdmin();
+    $pdo = Db::pdo();
+    $rows = $pdo->query('
+        SELECT ss.id, ss.status, ss.annual_quota, ss.created_at, ss.paid_at,
+               s.name AS school_name,
+               p.name AS pkg_name
+        FROM school_subscriptions ss
+        JOIN schools s ON s.id = ss.school_id
+        JOIN quota_packages p ON p.id = ss.package_id
+        ORDER BY ss.created_at DESC
+        LIMIT 200
+    ')->fetchAll();
+    $csrf = Csrf::input();
+    $items = '';
+    foreach ($rows as $r) {
+        $id = (int)$r['id'];
+        $items .= '<tr>';
+        $items .= '<td>' . View::e((string)$id) . '</td>';
+        $items .= '<td>' . View::e((string)$r['school_name']) . '</td>';
+        $items .= '<td>' . View::e((string)$r['pkg_name']) . ' (+' . View::e((string)$r['annual_quota']) . ')</td>';
+        $items .= '<td>' . View::e((string)$r['status']) . '</td>';
+        $items .= '<td>' . View::e((string)$r['created_at']) . '</td>';
+        $items .= '<td>' . View::e((string)($r['paid_at'] ?? '')) . '</td>';
+        $items .= '<td>';
+        if ((string)$r['status'] === 'pending') {
+            $items .= "<form method=\"post\" action=\"/admin/subscriptions/mark-paid\" style=\"margin:0\">{$csrf}<input type=\"hidden\" name=\"id\" value=\"{$id}\" /><button type=\"submit\">Ödendi (aktif et)</button></form>";
+        }
+        $items .= '</td>';
+        $items .= '</tr>';
+    }
+    $html = View::layout('Üyelikler', <<<HTML
+<h1>Üyelik / Paket Onayları</h1>
+<p><a href="/admin/packages">Paketler</a> | <a href="/admin/orders">Ek kota siparişleri</a></p>
+<table border="1" cellpadding="6" cellspacing="0">
+  <thead><tr><th>ID</th><th>Okul</th><th>Paket</th><th>Durum</th><th>Oluşturma</th><th>Ödeme</th><th>İşlem</th></tr></thead>
+  <tbody>{$items}</tbody>
+</table>
+<p><a href="/">Ana sayfa</a></p>
+HTML);
+    Http::html(200, $html);
+    exit;
+}
+
+if ($path === '/admin/subscriptions/mark-paid' && $method === 'POST') {
+    requireSiteAdmin();
+    Csrf::validatePost();
+    $pdo = Db::pdo();
+    $id = (int)($_POST['id'] ?? 0);
+    if ($id <= 0) {
+        Http::badRequest("Geçersiz üyelik.\n");
+        exit;
+    }
+
+    $pdo->beginTransaction();
+    try {
+        $stmt = $pdo->prepare('SELECT * FROM school_subscriptions WHERE id = :id FOR UPDATE');
+        $stmt->execute([':id' => $id]);
+        $sub = $stmt->fetch();
+        if (!$sub || (string)$sub['status'] !== 'pending') {
+            $pdo->rollBack();
+            Http::badRequest("Üyelik bulunamadı veya zaten işlenmiş.\n");
+            exit;
+        }
+        $schoolId = (int)$sub['school_id'];
+
+        // Aktif başka üyelik varsa expired yap (tek aktif)
+        $pdo->prepare('UPDATE school_subscriptions SET status = :exp WHERE school_id = :sid AND status = :act')
+            ->execute([':exp' => 'expired', ':sid' => $schoolId, ':act' => 'active']);
+
+        // Bu üyeliği aktif et (1 yıl)
+        $pdo->prepare('
+            UPDATE school_subscriptions
+            SET status = :st, paid_at = NOW(), starts_at = NOW(), ends_at = DATE_ADD(NOW(), INTERVAL 1 YEAR)
+            WHERE id = :id
+        ')->execute([':st' => 'active', ':id' => $id]);
+
+        $pdo->commit();
+    } catch (\\Throwable $e) {
+        $pdo->rollBack();
+        Http::text(500, "Üyelik onaylanamadı.\n");
+        exit;
+    }
+
+    redirect('/admin/subscriptions');
 }
 
 Http::notFound();

@@ -74,6 +74,28 @@ CREATE TABLE IF NOT EXISTS quota_packages (
   INDEX idx_quota_packages_active (active)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- 7.1) Yıllık üyelik/paket (ilk üyelik)
+CREATE TABLE IF NOT EXISTS school_subscriptions (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  school_id BIGINT UNSIGNED NOT NULL,
+  package_id BIGINT UNSIGNED NOT NULL,
+  status ENUM('pending','active','expired','cancelled') NOT NULL DEFAULT 'pending',
+  annual_quota INT UNSIGNED NOT NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  paid_at DATETIME NULL,
+  starts_at DATETIME NULL,
+  ends_at DATETIME NULL,
+  PRIMARY KEY (id),
+  INDEX idx_school_subscriptions_school (school_id),
+  INDEX idx_school_subscriptions_status (status),
+  CONSTRAINT fk_school_subscriptions_school
+    FOREIGN KEY (school_id) REFERENCES schools(id)
+    ON DELETE CASCADE,
+  CONSTRAINT fk_school_subscriptions_package
+    FOREIGN KEY (package_id) REFERENCES quota_packages(id)
+    ON DELETE RESTRICT
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS quota_orders (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   school_id BIGINT UNSIGNED NOT NULL,
