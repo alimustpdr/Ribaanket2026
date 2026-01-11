@@ -95,6 +95,13 @@ function allowedAudiences(string $schoolType): array {
     return ['ogrenci', 'veli', 'ogretmen'];
 }
 
+function activeCampaign(\PDO $pdo, int $schoolId): ?array {
+    $stmt = $pdo->prepare('SELECT * FROM campaigns WHERE school_id = :sid AND status = :st LIMIT 1');
+    $stmt->execute([':sid' => $schoolId, ':st' => 'active']);
+    $row = $stmt->fetch();
+    return $row ?: null;
+}
+
 if ($path === '/' && $method === 'GET') {
     $html = View::layout('RİBA', <<<HTML
 <h1>RİBA Sistemi</h1>
@@ -277,12 +284,265 @@ if ($path === '/panel' && $method === 'GET') {
 <p><strong>Tür:</strong> {$type}</p>
 <ul>
   <li><a href="/panel/classes">Sınıflar</a></li>
+  <li><a href="/panel/campaigns">Yıllık Süreç (Kampanya)</a></li>
   <li><a href="/panel/reports">Raporlar</a></li>
 </ul>
 <form method="post" action="/logout">{$csrf}<button type="submit">Çıkış</button></form>
 HTML);
     Http::html(200, $html);
     exit;
+}
+
+// -------------------------
+// Okul Paneli: Kampanyalar (yıllık süreç)
+// -------------------------
+if ($path === '/panel/campaigns' && $method === 'GET') {
+    $ctx = requireSchoolAdmin();
+    $pdo = Db::pdo();
+
+    $schoolStmt = $pdo->prepare('SELECT id, name, school_type FROM schools WHERE id = :id LIMIT 1');
+    $schoolStmt->execute([':id' => $ctx['school_id']]);
+    $school = $schoolStmt->fetch();
+    if (!$school) {
+        Http::notFound();
+        exit;
+    }
+    $schoolName = View::e((string)$school['name']);
+
+    $rows = $pdo->prepare('SELECT id, year, name, status, starts_at, ends_at, response_quota, created_at FROM campaigns WHERE school_id = :sid ORDER BY year DESC');
+    $rows->execute([':sid' => $ctx['school_id']]);
+    $campaigns = $rows->fetchAll();
+
+    $items = '';
+    foreach ($campaigns as $c) {
+        $id = (int)$c['id'];
+        $items .= '<tr>';
+        $items .= '<td>' . View::e((string)$c['year']) . '</td>';
+        $items .= '<td>' . View::e((string)$c['name']) . '</td>';
+        $items .= '<td>' . View::e((string)$c['status']) . '</td>';
+        $items .= '<td>' . View::e((string)$c['starts_at']) . '</td>';
+        $items .= '<td>' . View::e((string)$c['ends_at']) . '</td>';
+        $items .= '<td>' . View::e((string)$c['response_quota']) . '</td>';
+        $items .= '<td>';
+        $items .= '<a href="/panel/campaigns/' . $id . '">Detay</a>';
+        $items .= '</td>';
+        $items .= '</tr>';
+    }
+
+    $csrf = Csrf::input();
+    $defaultYear = (int)date('Y');
+    $now = date('Y-m-d\\TH:i');
+    $nextYear = date('Y-m-d\\TH:i', time() + 3600 * 24 * 365);
+    $html = View::layout('Kampanyalar', <<<HTML
+<h1>Yıllık Süreç (Kampanya)</h1>
+<p><strong>Okul:</strong> {$schoolName}</p>
+<p>Her yıl için ayrı kampanya oluşturulur. Linkler kampanya aktifken çalışır; kota bitince otomatik kapanır.</p>
+<table border="1" cellpadding="6" cellspacing="0">
+  <thead><tr><th>Yıl</th><th>Ad</th><th>Durum</th><th>Başlangıç</th><th>Bitiş</th><th>Kota</th><th></th></tr></thead>
+  <tbody>{$items}</tbody>
+</table>
+<hr />
+<h2>Yeni kampanya oluştur</h2>
+<form method="post" action="/panel/campaigns/create">
+  {$csrf}
+  <p><label>Yıl<br /><input type="number" name="year" value="{$defaultYear}" required /></label></p>
+  <p><label>Ad<br /><input name="name" value="RİBA {$defaultYear}" required /></label></p>
+  <p><label>Başlangıç<br /><input type="datetime-local" name="starts_at" value="{$now}" required /></label></p>
+  <p><label>Bitiş<br /><input type="datetime-local" name="ends_at" value="{$nextYear}" required /></label></p>
+  <p><label>Yıllık toplam yanıt kotası (öğrenci+veli+öğretmen toplamı)<br /><input type="number" name="response_quota" placeholder="Örn: 1100" required /></label></p>
+  <p><button type="submit">Oluştur</button></p>
+</form>
+<p><a href="/panel">Geri</a></p>
+HTML);
+    Http::html(200, $html);
+    exit;
+}
+
+if ($path === '/panel/campaigns/create' && $method === 'POST') {
+    $ctx = requireSchoolAdmin();
+    Csrf::validatePost();
+    $year = (int)($_POST['year'] ?? 0);
+    $name = trim((string)($_POST['name'] ?? ''));
+    $startsAt = (string)($_POST['starts_at'] ?? '');
+    $endsAt = (string)($_POST['ends_at'] ?? '');
+    $quota = (int)($_POST['response_quota'] ?? 0);
+
+    if ($year <= 0 || $name === '' || $startsAt === '' || $endsAt === '' || $quota <= 0) {
+        Http::badRequest("Eksik/yanlış bilgi.\n");
+        exit;
+    }
+
+    $pdo = Db::pdo();
+    try {
+        $stmt = $pdo->prepare('
+            INSERT INTO campaigns (school_id, year, name, status, starts_at, ends_at, response_quota)
+            VALUES (:sid, :year, :name, :status, :starts_at, :ends_at, :quota)
+        ');
+        $stmt->execute([
+            ':sid' => $ctx['school_id'],
+            ':year' => $year,
+            ':name' => $name,
+            ':status' => 'draft',
+            ':starts_at' => str_replace('T', ' ', $startsAt) . ':00',
+            ':ends_at' => str_replace('T', ' ', $endsAt) . ':00',
+            ':quota' => $quota,
+        ]);
+    } catch (\Throwable $e) {
+        Http::text(500, "Kampanya oluşturulamadı (aynı yıl zaten var olabilir).\n");
+        exit;
+    }
+    redirect('/panel/campaigns');
+}
+
+if (preg_match('#^/panel/campaigns/(\\d+)$#', $path, $m) && $method === 'GET') {
+    $ctx = requireSchoolAdmin();
+    $campaignId = (int)$m[1];
+    $pdo = Db::pdo();
+
+    $campStmt = $pdo->prepare('SELECT * FROM campaigns WHERE id = :id AND school_id = :sid LIMIT 1');
+    $campStmt->execute([':id' => $campaignId, ':sid' => $ctx['school_id']]);
+    $camp = $campStmt->fetch();
+    if (!$camp) {
+        Http::notFound();
+        exit;
+    }
+
+    $usedStmt = $pdo->prepare('SELECT COUNT(*) AS cnt FROM responses WHERE campaign_id = :cid');
+    $usedStmt->execute([':cid' => $campaignId]);
+    $used = (int)($usedStmt->fetch()['cnt'] ?? 0);
+    $quota = (int)$camp['response_quota'];
+    $remaining = max(0, $quota - $used);
+
+    $csrf = Csrf::input();
+    $status = View::e((string)$camp['status']);
+    $name = View::e((string)$camp['name']);
+    $startsAt = View::e((string)$camp['starts_at']);
+    $endsAt = View::e((string)$camp['ends_at']);
+
+    $actions = '';
+    if ((string)$camp['status'] === 'draft') {
+        $actions .= "<form method=\"post\" action=\"/panel/campaigns/{$campaignId}/activate\">{$csrf}<button type=\"submit\">Aktif et ve linkleri üret</button></form>";
+    } elseif ((string)$camp['status'] === 'active') {
+        $actions .= "<form method=\"post\" action=\"/panel/campaigns/{$campaignId}/close\">{$csrf}<button type=\"submit\">Kampanyayı kapat</button></form>";
+    }
+
+    $html = View::layout('Kampanya Detayı', <<<HTML
+<h1>Kampanya</h1>
+<p><strong>Ad:</strong> {$name}</p>
+<p><strong>Durum:</strong> {$status}</p>
+<p><strong>Başlangıç:</strong> {$startsAt}</p>
+<p><strong>Bitiş:</strong> {$endsAt}</p>
+<p><strong>Kota:</strong> {$quota} | <strong>Kullanım:</strong> {$used} | <strong>Kalan:</strong> {$remaining}</p>
+{$actions}
+<p><a href="/panel/campaigns">Geri</a></p>
+HTML);
+    Http::html(200, $html);
+    exit;
+}
+
+if (preg_match('#^/panel/campaigns/(\\d+)/activate$#', $path, $m) && $method === 'POST') {
+    $ctx = requireSchoolAdmin();
+    Csrf::validatePost();
+    $campaignId = (int)$m[1];
+    $pdo = Db::pdo();
+
+    $pdo->beginTransaction();
+    try {
+        // Kampanya doğrula
+        $campStmt = $pdo->prepare('SELECT id, status, starts_at, ends_at FROM campaigns WHERE id = :id AND school_id = :sid LIMIT 1');
+        $campStmt->execute([':id' => $campaignId, ':sid' => $ctx['school_id']]);
+        $camp = $campStmt->fetch();
+        if (!$camp) {
+            $pdo->rollBack();
+            Http::notFound();
+            exit;
+        }
+        if ((string)$camp['status'] !== 'draft') {
+            $pdo->rollBack();
+            Http::badRequest("Sadece taslak kampanya aktif edilebilir.\n");
+            exit;
+        }
+
+        // Aynı okulda aktif başka kampanya varsa kapat (yıllık süreçlerin karışmaması için)
+        $pdo->prepare('UPDATE campaigns SET status = :closed, closed_at = NOW() WHERE school_id = :sid AND status = :active')
+            ->execute([':closed' => 'closed', ':sid' => $ctx['school_id'], ':active' => 'active']);
+
+        // Bu kampanyayı aktif et
+        $pdo->prepare('UPDATE campaigns SET status = :st, activated_at = NOW() WHERE id = :id')
+            ->execute([':st' => 'active', ':id' => $campaignId]);
+
+        // Okul türü ve sınıflar
+        $schoolTypeStmt = $pdo->prepare('SELECT school_type FROM schools WHERE id = :id LIMIT 1');
+        $schoolTypeStmt->execute([':id' => $ctx['school_id']]);
+        $schoolType = (string)($schoolTypeStmt->fetch()['school_type'] ?? '');
+
+        $classesStmt = $pdo->prepare('SELECT id FROM classes WHERE school_id = :sid');
+        $classesStmt->execute([':sid' => $ctx['school_id']]);
+        $classIds = array_map(static fn($r) => (int)$r['id'], $classesStmt->fetchAll());
+
+        $ins = $pdo->prepare('
+            INSERT INTO form_instances (school_id, campaign_id, class_id, audience, public_id, status)
+            VALUES (:sid, :camp, :cid, :aud, :pid, :st)
+        ');
+        foreach ($classIds as $cid) {
+            foreach (allowedAudiences($schoolType) as $aud) {
+                $pid = bin2hex(random_bytes(16));
+                $ins->execute([
+                    ':sid' => $ctx['school_id'],
+                    ':camp' => $campaignId,
+                    ':cid' => $cid,
+                    ':aud' => $aud,
+                    ':pid' => $pid,
+                    ':st' => 'active',
+                ]);
+            }
+        }
+
+        $pdo->commit();
+    } catch (\Throwable $e) {
+        $pdo->rollBack();
+        Http::text(500, "Kampanya aktif edilemedi.\n");
+        exit;
+    }
+
+    redirect('/panel/campaigns/' . $campaignId);
+}
+
+if (preg_match('#^/panel/campaigns/(\\d+)/close$#', $path, $m) && $method === 'POST') {
+    $ctx = requireSchoolAdmin();
+    Csrf::validatePost();
+    $campaignId = (int)$m[1];
+    $pdo = Db::pdo();
+
+    $pdo->beginTransaction();
+    try {
+        $campStmt = $pdo->prepare('SELECT id, status FROM campaigns WHERE id = :id AND school_id = :sid LIMIT 1');
+        $campStmt->execute([':id' => $campaignId, ':sid' => $ctx['school_id']]);
+        $camp = $campStmt->fetch();
+        if (!$camp) {
+            $pdo->rollBack();
+            Http::notFound();
+            exit;
+        }
+        if ((string)$camp['status'] !== 'active') {
+            $pdo->rollBack();
+            Http::badRequest("Sadece aktif kampanya kapatılabilir.\n");
+            exit;
+        }
+
+        $pdo->prepare('UPDATE campaigns SET status = :st, closed_at = NOW() WHERE id = :id')
+            ->execute([':st' => 'closed', ':id' => $campaignId]);
+        $pdo->prepare('UPDATE form_instances SET status = :st WHERE campaign_id = :cid')
+            ->execute([':st' => 'closed', ':cid' => $campaignId]);
+
+        $pdo->commit();
+    } catch (\Throwable $e) {
+        $pdo->rollBack();
+        Http::text(500, "Kampanya kapatılamadı.\n");
+        exit;
+    }
+
+    redirect('/panel/campaigns/' . $campaignId);
 }
 
 // -------------------------
@@ -541,6 +801,14 @@ if ($path === '/panel/classes' && $method === 'GET') {
         exit;
     }
 
+    $activeCamp = activeCampaign($pdo, (int)$ctx['school_id']);
+    $campNote = '';
+    if (!$activeCamp) {
+        $campNote = '<p><strong>Uyarı:</strong> Aktif kampanya yok. Anket linkleri üretmek için önce <a href="/panel/campaigns">kampanyayı</a> aktif edin.</p>';
+    } else {
+        $campNote = '<p><strong>Aktif kampanya:</strong> ' . View::e((string)$activeCamp['name']) . ' (' . View::e((string)$activeCamp['year']) . ')</p>';
+    }
+
     $rows = $pdo->prepare('SELECT id, name, created_at FROM classes WHERE school_id = :sid ORDER BY created_at DESC');
     $rows->execute([':sid' => $ctx['school_id']]);
     $classes = $rows->fetchAll();
@@ -557,7 +825,7 @@ if ($path === '/panel/classes' && $method === 'GET') {
     $csrf = Csrf::input();
     $html = View::layout('Sınıflar', <<<HTML
 <h1>Sınıflar</h1>
-<p>Okul türüne göre (sadece bu okulun türü) anket linkleri üretilecektir.</p>
+{$campNote}
 <ul>{$items}</ul>
 <hr />
 <h2>Yeni sınıf ekle</h2>
@@ -582,37 +850,10 @@ if ($path === '/panel/classes/create' && $method === 'POST') {
     }
 
     $pdo = Db::pdo();
-    $schoolStmt = $pdo->prepare('SELECT id, school_type FROM schools WHERE id = :id LIMIT 1');
-    $schoolStmt->execute([':id' => $ctx['school_id']]);
-    $school = $schoolStmt->fetch();
-    if (!$school) {
-        Http::notFound();
-        exit;
-    }
-    $schoolType = (string)$school['school_type'];
-
-    $pdo->beginTransaction();
     try {
         $stmt = $pdo->prepare('INSERT INTO classes (school_id, name) VALUES (:sid, :name)');
         $stmt->execute([':sid' => $ctx['school_id'], ':name' => $name]);
-        $classId = (int)$pdo->lastInsertId();
-
-        // Bu sınıf için (hedef kitlelere göre) tek link oluştur
-        foreach (allowedAudiences($schoolType) as $aud) {
-            $publicId = bin2hex(random_bytes(16));
-            $pdo->prepare('INSERT INTO form_instances (school_id, class_id, audience, public_id, status) VALUES (:sid, :cid, :aud, :pid, :st)')
-                ->execute([
-                    ':sid' => $ctx['school_id'],
-                    ':cid' => $classId,
-                    ':aud' => $aud,
-                    ':pid' => $publicId,
-                    ':st' => 'active',
-                ]);
-        }
-
-        $pdo->commit();
     } catch (\Throwable $e) {
-        $pdo->rollBack();
         Http::text(500, "Sınıf eklenemedi.\n");
         exit;
     }
@@ -642,8 +883,28 @@ if (preg_match('#^/panel/classes/(\\d+)$#', $path, $m) && $method === 'GET') {
         exit;
     }
 
-    $formsStmt = $pdo->prepare('SELECT id, audience, public_id, status FROM form_instances WHERE class_id = :cid AND school_id = :sid ORDER BY audience');
-    $formsStmt->execute([':cid' => $classId, ':sid' => $ctx['school_id']]);
+    $activeCamp = activeCampaign($pdo, (int)$ctx['school_id']);
+    if (!$activeCamp) {
+        $cname = View::e((string)$class['name']);
+        $html = View::layout('Anket Linkleri', <<<HTML
+<h1>Anket Linkleri</h1>
+<p><strong>Sınıf:</strong> {$cname}</p>
+<p><strong>Uyarı:</strong> Aktif kampanya yok. Link üretmek için <a href="/panel/campaigns">kampanyayı</a> aktif edin.</p>
+<p><a href="/panel/classes">Geri</a></p>
+HTML);
+        Http::html(200, $html);
+        exit;
+    }
+    $campaignId = (int)$activeCamp['id'];
+    $campName = View::e((string)$activeCamp['name']);
+
+    $formsStmt = $pdo->prepare('
+        SELECT id, audience, public_id, status
+        FROM form_instances
+        WHERE class_id = :cid AND school_id = :sid AND campaign_id = :camp
+        ORDER BY audience
+    ');
+    $formsStmt->execute([':cid' => $classId, ':sid' => $ctx['school_id'], ':camp' => $campaignId]);
     $forms = $formsStmt->fetchAll();
 
     $base = (string)($_SERVER['HTTP_HOST'] ?? '');
@@ -672,6 +933,7 @@ if (preg_match('#^/panel/classes/(\\d+)$#', $path, $m) && $method === 'GET') {
     $html = View::layout('Anket Linkleri', <<<HTML
 <h1>Anket Linkleri</h1>
 <p><strong>Sınıf:</strong> {$cname}</p>
+<p><strong>Kampanya:</strong> {$campName}</p>
 <table border="1" cellpadding="6" cellspacing="0">
   <thead><tr><th>Hedef kitle</th><th>Link</th><th>Kopyala</th></tr></thead>
   <tbody>{$rows}</tbody>
