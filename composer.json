@@ -1,0 +1,9 @@
+{
+  "name": "riba/riba",
+  "description": "RİBA çok okullu anket sistemi (düz PHP).",
+  "require": {
+    "php": ">=8.1",
+    "phpoffice/phpspreadsheet": "^2.2"
+  }
+}
+
