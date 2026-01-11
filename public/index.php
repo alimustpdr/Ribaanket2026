@@ -304,12 +304,83 @@ if ($path === '/panel/reports' && $method === 'GET') {
     $html = View::layout('Raporlar', <<<HTML
 <h1>Raporlar</h1>
 <p><strong>Okul:</strong> {$name}</p>
+<ul>
+  <li><a href="/panel/reports/view">Web üzerinde görüntüle</a></li>
+</ul>
 <p>Excel çıktı formatı: <code>riba_light_report_output.xlsx</code> (ASP + dağılım).</p>
 <form method="post" action="/panel/reports/export">
   {$csrf}
   <button type="submit">Okul raporunu indir (Excel)</button>
 </form>
 <p><a href="/panel">Geri</a></p>
+HTML);
+    Http::html(200, $html);
+    exit;
+}
+
+if ($path === '/panel/reports/view' && $method === 'GET') {
+    $ctx = requireSchoolAdmin();
+    $pdo = Db::pdo();
+
+    $schoolStmt = $pdo->prepare('SELECT id, name, school_type FROM schools WHERE id = :id LIMIT 1');
+    $schoolStmt->execute([':id' => $ctx['school_id']]);
+    $school = $schoolStmt->fetch();
+    if (!$school) {
+        Http::notFound();
+        exit;
+    }
+    $schoolType = (string)$school['school_type'];
+    $schoolName = View::e((string)$school['name']);
+
+    $scoring = RibaReport::scoring();
+    $cfg = $scoring[$schoolType] ?? null;
+    if (!is_array($cfg)) {
+        Http::text(500, "Bu okul türü için puanlama bulunamadı.\n");
+        exit;
+    }
+    $rsList = $cfg['rs_list'] ?? [];
+    $targets = $cfg['targets'] ?? [];
+
+    $classesStmt = $pdo->prepare('SELECT id, name FROM classes WHERE school_id = :sid ORDER BY created_at ASC');
+    $classesStmt->execute([':sid' => $ctx['school_id']]);
+    $classes = $classesStmt->fetchAll();
+
+    $classAspByClassId = [];
+    foreach ($classes as $c) {
+        $cid = (int)$c['id'];
+        $res = RibaReport::classAsp($pdo, $schoolType, (int)$ctx['school_id'], $cid);
+        $classAspByClassId[$cid] = $res['asp'];
+    }
+    $schoolAsp = RibaReport::schoolAspAverage($classAspByClassId, $rsList);
+
+    $rowsHtml = '';
+    foreach ($rsList as $rs) {
+        $t = View::e((string)($targets[$rs] ?? ''));
+        $v = $schoolAsp[$rs] ?? null;
+        $vv = ($v === null) ? '-' : number_format((float)$v, 2, '.', '');
+        $rowsHtml .= '<tr><td>' . (int)$rs . '</td><td>' . $t . '</td><td>' . $vv . '</td></tr>';
+    }
+
+    $classList = '';
+    foreach ($classes as $c) {
+        $cid = (int)$c['id'];
+        $cname = View::e((string)$c['name']);
+        $classList .= '<li><a href="/panel/classes/' . $cid . '/view">' . $cname . ' (web)</a> — ';
+        $classList .= '<a href="/panel/classes/' . $cid . '/report" target="_blank" rel="noopener">Excel</a></li>';
+    }
+
+    $html = View::layout('Okul Raporu', <<<HTML
+<h1>Okul Raporu (Web)</h1>
+<p><strong>Okul:</strong> {$schoolName}</p>
+<p><strong>Tür:</strong> <code>{$schoolType}</code></p>
+<h2>ASP (Okul ortalaması)</h2>
+<table border="1" cellpadding="6" cellspacing="0">
+  <thead><tr><th>RS</th><th>Hedef</th><th>ASP</th></tr></thead>
+  <tbody>{$rowsHtml}</tbody>
+</table>
+<h2>Sınıflar</h2>
+<ul>{$classList}</ul>
+<p><a href="/panel/reports">Geri</a></p>
 HTML);
     Http::html(200, $html);
     exit;
@@ -605,8 +676,107 @@ if (preg_match('#^/panel/classes/(\\d+)$#', $path, $m) && $method === 'GET') {
   <thead><tr><th>Hedef kitle</th><th>Link</th><th>Kopyala</th></tr></thead>
   <tbody>{$rows}</tbody>
 </table>
-<p><a href="/panel/classes/{$classId}/report" target="_blank" rel="noopener">Bu sınıfın raporunu indir (Excel)</a></p>
+<p>
+  <a href="/panel/classes/{$classId}/view">Bu sınıfın raporunu görüntüle (Web)</a>
+  |
+  <a href="/panel/classes/{$classId}/report" target="_blank" rel="noopener">Bu sınıfın raporunu indir (Excel)</a>
+</p>
 <p><a href="/panel/classes">Geri</a></p>
+HTML);
+    Http::html(200, $html);
+    exit;
+}
+
+if (preg_match('#^/panel/classes/(\\d+)/view$#', $path, $m) && $method === 'GET') {
+    $ctx = requireSchoolAdmin();
+    $classId = (int)$m[1];
+    $pdo = Db::pdo();
+
+    $schoolStmt = $pdo->prepare('SELECT id, name, school_type FROM schools WHERE id = :id LIMIT 1');
+    $schoolStmt->execute([':id' => $ctx['school_id']]);
+    $school = $schoolStmt->fetch();
+    if (!$school) {
+        Http::notFound();
+        exit;
+    }
+    $schoolType = (string)$school['school_type'];
+    $schoolName = View::e((string)$school['name']);
+
+    $classStmt = $pdo->prepare('SELECT id, name FROM classes WHERE id = :cid AND school_id = :sid LIMIT 1');
+    $classStmt->execute([':cid' => $classId, ':sid' => $ctx['school_id']]);
+    $class = $classStmt->fetch();
+    if (!$class) {
+        Http::notFound();
+        exit;
+    }
+    $className = View::e((string)$class['name']);
+
+    $scoring = RibaReport::scoring();
+    $cfg = $scoring[$schoolType] ?? null;
+    if (!is_array($cfg)) {
+        Http::text(500, "Bu okul türü için puanlama bulunamadı.\n");
+        exit;
+    }
+    $rsList = $cfg['rs_list'] ?? [];
+    $targets = $cfg['targets'] ?? [];
+
+    $aspRes = RibaReport::classAsp($pdo, $schoolType, (int)$ctx['school_id'], $classId);
+    $aspByRs = $aspRes['asp'];
+
+    $aspRows = '';
+    foreach ($rsList as $rs) {
+        $t = View::e((string)($targets[$rs] ?? ''));
+        $v = $aspByRs[$rs] ?? null;
+        $vv = ($v === null) ? '-' : number_format((float)$v, 2, '.', '');
+        $aspRows .= '<tr><td>' . (int)$rs . '</td><td>' . $t . '</td><td>' . $vv . '</td></tr>';
+    }
+
+    $forms = RibaReport::classFormInstances($pdo, (int)$ctx['school_id'], $classId);
+    $distBlocks = '';
+    foreach ($forms as $aud => $formId) {
+        $dist = RibaReport::distributionForForm($pdo, (int)$formId);
+        $counts = $dist['counts'];
+        ksort($counts);
+
+        $rows2 = '';
+        foreach ($counts as $itemNo => $ab) {
+            $total = (int)$ab['total'];
+            $pctA = $total > 0 ? ((int)$ab['A'] / $total) * 100.0 : 0.0;
+            $pctB = $total > 0 ? ((int)$ab['B'] / $total) * 100.0 : 0.0;
+            $rows2 .= '<tr>';
+            $rows2 .= '<td>' . (int)$itemNo . '</td>';
+            $rows2 .= '<td>' . (int)$ab['A'] . '</td>';
+            $rows2 .= '<td>' . (int)$ab['B'] . '</td>';
+            $rows2 .= '<td>' . $total . '</td>';
+            $rows2 .= '<td>' . number_format($pctA, 1, '.', '') . '%</td>';
+            $rows2 .= '<td>' . number_format($pctB, 1, '.', '') . '%</td>';
+            $rows2 .= '</tr>';
+        }
+
+        $audTitle = View::e((string)$aud);
+        $distBlocks .= <<<HTML
+<h3>Dağılım ({$audTitle})</h3>
+<table border="1" cellpadding="6" cellspacing="0">
+  <thead><tr><th>Madde</th><th>A</th><th>B</th><th>Toplam</th><th>%A</th><th>%B</th></tr></thead>
+  <tbody>{$rows2}</tbody>
+</table>
+HTML;
+    }
+
+    $html = View::layout('Sınıf Raporu', <<<HTML
+<h1>Sınıf Raporu (Web)</h1>
+<p><strong>Okul:</strong> {$schoolName}</p>
+<p><strong>Sınıf:</strong> {$className}</p>
+<p><strong>Tür:</strong> <code>{$schoolType}</code></p>
+<p><a href="/panel/classes/{$classId}/report" target="_blank" rel="noopener">Excel indir</a></p>
+<h2>ASP (Sınıf)</h2>
+<table border="1" cellpadding="6" cellspacing="0">
+  <thead><tr><th>RS</th><th>Hedef</th><th>ASP</th></tr></thead>
+  <tbody>{$aspRows}</tbody>
+</table>
+<h2>İşaretleme dağılımı (A/B)</h2>
+{$distBlocks}
+<p><a href="/panel/classes/{$classId}">Geri</a></p>
 HTML);
     Http::html(200, $html);
     exit;
