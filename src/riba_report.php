@@ -79,7 +79,7 @@ final class RibaReport
      *
      * @return array{asp: array<int,float|null>, targets: array<int,string>}
      */
-    public static function classAsp(PDO $pdo, string $schoolType, int $schoolId, int $classId): array
+    public static function classAsp(PDO $pdo, string $schoolType, int $schoolId, int $campaignId, int $classId): array
     {
         $scoring = self::scoring();
         if (!isset($scoring[$schoolType])) {
@@ -96,8 +96,8 @@ final class RibaReport
         /** @var array<string,array<int,array{item_no:int,choice:string}|null>> $mappings */
         $mappings = $cfg['mappings'] ?? [];
 
-        // Form instance id'lerini bul (sınıf + hedef kitle)
-        $forms = self::classFormInstances($pdo, $schoolId, $classId);
+        // Form instance id'lerini bul (dönem + sınıf + hedef kitle)
+        $forms = self::classFormInstances($pdo, $schoolId, $campaignId, $classId);
 
         // Her hedef kitle için f ve z hesapla
         $zScoresByAudience = [];
@@ -190,14 +190,14 @@ final class RibaReport
     /**
      * @return array<string,int> audience => form_instance_id
      */
-    public static function classFormInstances(PDO $pdo, int $schoolId, int $classId): array
+    public static function classFormInstances(PDO $pdo, int $schoolId, int $campaignId, int $classId): array
     {
         $stmt = $pdo->prepare('
             SELECT audience, id
             FROM form_instances
-            WHERE school_id = :sid AND class_id = :cid
+            WHERE school_id = :sid AND campaign_id = :camp AND class_id = :cid
         ');
-        $stmt->execute([':sid' => $schoolId, ':cid' => $classId]);
+        $stmt->execute([':sid' => $schoolId, ':camp' => $campaignId, ':cid' => $classId]);
         $out = [];
         foreach ($stmt->fetchAll() as $row) {
             $out[(string)$row['audience']] = (int)$row['id'];

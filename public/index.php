@@ -102,6 +102,50 @@ function activeCampaign(\PDO $pdo, int $schoolId): ?array {
     return $row ?: null;
 }
 
+function getCampaignById(\PDO $pdo, int $schoolId, int $campaignId): ?array {
+    $stmt = $pdo->prepare('SELECT * FROM campaigns WHERE id = :id AND school_id = :sid LIMIT 1');
+    $stmt->execute([':id' => $campaignId, ':sid' => $schoolId]);
+    $row = $stmt->fetch();
+    return $row ?: null;
+}
+
+function currentCampaignForReports(\PDO $pdo, int $schoolId, ?int $requestedCampaignId): ?array {
+    if ($requestedCampaignId !== null && $requestedCampaignId > 0) {
+        return getCampaignById($pdo, $schoolId, $requestedCampaignId);
+    }
+    return activeCampaign($pdo, $schoolId);
+}
+
+function closeCampaign(\PDO $pdo, int $schoolId, int $campaignId): void {
+    $pdo->prepare('UPDATE campaigns SET status = :st, closed_at = NOW() WHERE id = :id AND school_id = :sid')
+        ->execute([':st' => 'closed', ':id' => $campaignId, ':sid' => $schoolId]);
+    $pdo->prepare('UPDATE form_instances SET status = :st WHERE campaign_id = :cid AND school_id = :sid')
+        ->execute([':st' => 'closed', ':cid' => $campaignId, ':sid' => $schoolId]);
+}
+
+function campaignIsWithinWindow(array $camp): bool {
+    $now = time();
+    $start = strtotime((string)$camp['starts_at']);
+    $end = strtotime((string)$camp['ends_at']);
+    if ($start !== false && $now < $start) {
+        return false;
+    }
+    if ($end !== false && $now > $end) {
+        return false;
+    }
+    return true;
+}
+
+function campaignUsage(\PDO $pdo, int $campaignId): int {
+    $stmt = $pdo->prepare('SELECT COUNT(*) AS cnt FROM responses WHERE campaign_id = :cid');
+    $stmt->execute([':cid' => $campaignId]);
+    return (int)($stmt->fetch()['cnt'] ?? 0);
+}
+
+function campaignQuota(array $camp): int {
+    return (int)($camp['response_quota'] ?? 0);
+}
+
 if ($path === '/' && $method === 'GET') {
     $html = View::layout('RİBA', <<<HTML
 <h1>RİBA Sistemi</h1>
@@ -608,16 +652,40 @@ if ($path === '/panel/reports' && $method === 'GET') {
     }
     $csrf = Csrf::input();
     $name = View::e((string)$school['name']);
+    $requestedCampaignId = isset($_GET['campaign_id']) ? (int)$_GET['campaign_id'] : null;
+
+    $campaignsStmt = $pdo->prepare('SELECT id, year, name, status FROM campaigns WHERE school_id = :sid ORDER BY year DESC');
+    $campaignsStmt->execute([':sid' => $ctx['school_id']]);
+    $campaigns = $campaignsStmt->fetchAll();
+
+    $options = '<option value="">(Aktif dönem)</option>';
+    foreach ($campaigns as $c) {
+        $id = (int)$c['id'];
+        $label = (string)$c['year'] . ' - ' . (string)$c['name'] . ' [' . (string)$c['status'] . ']';
+        $sel = ($requestedCampaignId !== null && $requestedCampaignId === $id) ? ' selected' : '';
+        $options .= '<option value="' . $id . '"' . $sel . '>' . View::e($label) . '</option>';
+    }
+
+    $viewLink = '/panel/reports/view';
+    if ($requestedCampaignId !== null && $requestedCampaignId > 0) {
+        $viewLink .= '?campaign_id=' . $requestedCampaignId;
+    }
 
     $html = View::layout('Raporlar', <<<HTML
 <h1>Raporlar</h1>
 <p><strong>Okul:</strong> {$name}</p>
 <ul>
-  <li><a href="/panel/reports/view">Web üzerinde görüntüle</a></li>
+  <li><a href="{$viewLink}">Web üzerinde görüntüle</a></li>
 </ul>
 <p>Excel çıktı formatı: <code>riba_light_report_output.xlsx</code> (ASP + dağılım).</p>
+<h2>Anket dönemi seç</h2>
+<form method="get" action="/panel/reports">
+  <select name="campaign_id">{$options}</select>
+  <button type="submit">Seç</button>
+</form>
 <form method="post" action="/panel/reports/export">
   {$csrf}
+  <input type="hidden" name="campaign_id" value="{$requestedCampaignId}" />
   <button type="submit">Okul raporunu indir (Excel)</button>
 </form>
 <p><a href="/panel">Geri</a></p>
@@ -640,6 +708,16 @@ if ($path === '/panel/reports/view' && $method === 'GET') {
     $schoolType = (string)$school['school_type'];
     $schoolName = View::e((string)$school['name']);
 
+    $requestedCampaignId = isset($_GET['campaign_id']) ? (int)$_GET['campaign_id'] : null;
+    $camp = currentCampaignForReports($pdo, (int)$ctx['school_id'], $requestedCampaignId);
+    if (!$camp) {
+        Http::text(400, "Görüntülenecek anket dönemi bulunamadı.\n");
+        exit;
+    }
+    $campaignId = (int)$camp['id'];
+    $campName = View::e((string)$camp['name']);
+    $campYear = View::e((string)$camp['year']);
+
     $scoring = RibaReport::scoring();
     $cfg = $scoring[$schoolType] ?? null;
     if (!is_array($cfg)) {
@@ -656,7 +734,7 @@ if ($path === '/panel/reports/view' && $method === 'GET') {
     $classAspByClassId = [];
     foreach ($classes as $c) {
         $cid = (int)$c['id'];
-        $res = RibaReport::classAsp($pdo, $schoolType, (int)$ctx['school_id'], $cid);
+        $res = RibaReport::classAsp($pdo, $schoolType, (int)$ctx['school_id'], $campaignId, $cid);
         $classAspByClassId[$cid] = $res['asp'];
     }
     $schoolAsp = RibaReport::schoolAspAverage($classAspByClassId, $rsList);
@@ -673,14 +751,15 @@ if ($path === '/panel/reports/view' && $method === 'GET') {
     foreach ($classes as $c) {
         $cid = (int)$c['id'];
         $cname = View::e((string)$c['name']);
-        $classList .= '<li><a href="/panel/classes/' . $cid . '/view">' . $cname . ' (web)</a> — ';
-        $classList .= '<a href="/panel/classes/' . $cid . '/report" target="_blank" rel="noopener">Excel</a></li>';
+        $classList .= '<li><a href="/panel/classes/' . $cid . '/view?campaign_id=' . $campaignId . '">' . $cname . ' (web)</a> — ';
+        $classList .= '<a href="/panel/classes/' . $cid . '/report?campaign_id=' . $campaignId . '" target="_blank" rel="noopener">Excel</a></li>';
     }
 
     $html = View::layout('Okul Raporu', <<<HTML
 <h1>Okul Raporu (Web)</h1>
 <p><strong>Okul:</strong> {$schoolName}</p>
 <p><strong>Tür:</strong> <code>{$schoolType}</code></p>
+<p><strong>Anket dönemi:</strong> {$campYear} - {$campName}</p>
 <h2>ASP (Okul ortalaması)</h2>
 <table border="1" cellpadding="6" cellspacing="0">
   <thead><tr><th>RS</th><th>Hedef</th><th>ASP</th></tr></thead>
@@ -688,7 +767,7 @@ if ($path === '/panel/reports/view' && $method === 'GET') {
 </table>
 <h2>Sınıflar</h2>
 <ul>{$classList}</ul>
-<p><a href="/panel/reports">Geri</a></p>
+<p><a href="/panel/reports?campaign_id={$campaignId}">Geri</a></p>
 HTML);
     Http::html(200, $html);
     exit;
@@ -697,6 +776,7 @@ HTML);
 if ($path === '/panel/reports/export' && $method === 'POST') {
     $ctx = requireSchoolAdmin();
     Csrf::validatePost();
+    $requestedCampaignId = isset($_POST['campaign_id']) ? (int)$_POST['campaign_id'] : null;
 
     $pdo = Db::pdo();
     $schoolStmt = $pdo->prepare('SELECT id, name, school_type FROM schools WHERE id = :id LIMIT 1');
@@ -708,6 +788,13 @@ if ($path === '/panel/reports/export' && $method === 'POST') {
     }
     $schoolType = (string)$school['school_type'];
     $schoolName = (string)$school['name'];
+
+    $camp = currentCampaignForReports($pdo, (int)$ctx['school_id'], $requestedCampaignId);
+    if (!$camp) {
+        Http::text(400, "İndirilecek anket dönemi bulunamadı.\n");
+        exit;
+    }
+    $campaignId = (int)$camp['id'];
 
     $scoring = RibaReport::scoring();
     $cfg = $scoring[$schoolType] ?? null;
@@ -727,7 +814,7 @@ if ($path === '/panel/reports/export' && $method === 'POST') {
     $classAspByClassId = [];
     foreach ($classes as $c) {
         $cid = (int)$c['id'];
-        $res = RibaReport::classAsp($pdo, $schoolType, (int)$ctx['school_id'], $cid);
+        $res = RibaReport::classAsp($pdo, $schoolType, (int)$ctx['school_id'], $campaignId, $cid);
         $classAspByClassId[$cid] = $res['asp'];
     }
     $schoolAsp = RibaReport::schoolAspAverage($classAspByClassId, $rsList);
@@ -769,7 +856,7 @@ if ($path === '/panel/reports/export' && $method === 'POST') {
     foreach ($classes as $c) {
         $cid = (int)$c['id'];
         $cname = (string)$c['name'];
-        $forms = RibaReport::classFormInstances($pdo, (int)$ctx['school_id'], $cid);
+        $forms = RibaReport::classFormInstances($pdo, (int)$ctx['school_id'], $campaignId, $cid);
 
         foreach ($forms as $aud => $formId) {
             $dist = RibaReport::distributionForForm($pdo, (int)$formId);
@@ -1012,6 +1099,16 @@ if (preg_match('#^/panel/classes/(\\d+)/view$#', $path, $m) && $method === 'GET'
     $schoolType = (string)$school['school_type'];
     $schoolName = View::e((string)$school['name']);
 
+    $requestedCampaignId = isset($_GET['campaign_id']) ? (int)$_GET['campaign_id'] : null;
+    $camp = currentCampaignForReports($pdo, (int)$ctx['school_id'], $requestedCampaignId);
+    if (!$camp) {
+        Http::text(400, "Görüntülenecek anket dönemi bulunamadı.\n");
+        exit;
+    }
+    $campaignId = (int)$camp['id'];
+    $campName = View::e((string)$camp['name']);
+    $campYear = View::e((string)$camp['year']);
+
     $classStmt = $pdo->prepare('SELECT id, name FROM classes WHERE id = :cid AND school_id = :sid LIMIT 1');
     $classStmt->execute([':cid' => $classId, ':sid' => $ctx['school_id']]);
     $class = $classStmt->fetch();
@@ -1030,7 +1127,7 @@ if (preg_match('#^/panel/classes/(\\d+)/view$#', $path, $m) && $method === 'GET'
     $rsList = $cfg['rs_list'] ?? [];
     $targets = $cfg['targets'] ?? [];
 
-    $aspRes = RibaReport::classAsp($pdo, $schoolType, (int)$ctx['school_id'], $classId);
+    $aspRes = RibaReport::classAsp($pdo, $schoolType, (int)$ctx['school_id'], $campaignId, $classId);
     $aspByRs = $aspRes['asp'];
 
     $aspRows = '';
@@ -1041,7 +1138,7 @@ if (preg_match('#^/panel/classes/(\\d+)/view$#', $path, $m) && $method === 'GET'
         $aspRows .= '<tr><td>' . (int)$rs . '</td><td>' . $t . '</td><td>' . $vv . '</td></tr>';
     }
 
-    $forms = RibaReport::classFormInstances($pdo, (int)$ctx['school_id'], $classId);
+    $forms = RibaReport::classFormInstances($pdo, (int)$ctx['school_id'], $campaignId, $classId);
     $distBlocks = '';
     foreach ($forms as $aud => $formId) {
         $dist = RibaReport::distributionForForm($pdo, (int)$formId);
@@ -1078,7 +1175,8 @@ HTML;
 <p><strong>Okul:</strong> {$schoolName}</p>
 <p><strong>Sınıf:</strong> {$className}</p>
 <p><strong>Tür:</strong> <code>{$schoolType}</code></p>
-<p><a href="/panel/classes/{$classId}/report" target="_blank" rel="noopener">Excel indir</a></p>
+<p><strong>Anket dönemi:</strong> {$campYear} - {$campName}</p>
+<p><a href="/panel/classes/{$classId}/report?campaign_id={$campaignId}" target="_blank" rel="noopener">Excel indir</a></p>
 <h2>ASP (Sınıf)</h2>
 <table border="1" cellpadding="6" cellspacing="0">
   <thead><tr><th>RS</th><th>Hedef</th><th>ASP</th></tr></thead>
@@ -1096,6 +1194,7 @@ if (preg_match('#^/panel/classes/(\\d+)/report$#', $path, $m) && $method === 'GE
     $ctx = requireSchoolAdmin();
     $classId = (int)$m[1];
     $pdo = Db::pdo();
+    $requestedCampaignId = isset($_GET['campaign_id']) ? (int)$_GET['campaign_id'] : null;
 
     $schoolStmt = $pdo->prepare('SELECT id, name, school_type FROM schools WHERE id = :id LIMIT 1');
     $schoolStmt->execute([':id' => $ctx['school_id']]);
@@ -1106,6 +1205,13 @@ if (preg_match('#^/panel/classes/(\\d+)/report$#', $path, $m) && $method === 'GE
     }
     $schoolType = (string)$school['school_type'];
     $schoolName = (string)$school['name'];
+
+    $camp = currentCampaignForReports($pdo, (int)$ctx['school_id'], $requestedCampaignId);
+    if (!$camp) {
+        Http::text(400, "İndirilecek anket dönemi bulunamadı.\n");
+        exit;
+    }
+    $campaignId = (int)$camp['id'];
 
     $classStmt = $pdo->prepare('SELECT id, name FROM classes WHERE id = :cid AND school_id = :sid LIMIT 1');
     $classStmt->execute([':cid' => $classId, ':sid' => $ctx['school_id']]);
@@ -1124,7 +1230,7 @@ if (preg_match('#^/panel/classes/(\\d+)/report$#', $path, $m) && $method === 'GE
     $rsList = $cfg['rs_list'] ?? [];
     $targets = $cfg['targets'] ?? [];
 
-    $aspRes = RibaReport::classAsp($pdo, $schoolType, (int)$ctx['school_id'], $classId);
+    $aspRes = RibaReport::classAsp($pdo, $schoolType, (int)$ctx['school_id'], $campaignId, $classId);
     $aspByRs = $aspRes['asp'];
     $className = (string)$class['name'];
 
@@ -1141,7 +1247,7 @@ if (preg_match('#^/panel/classes/(\\d+)/report$#', $path, $m) && $method === 'GE
         ];
     }
 
-    $forms = RibaReport::classFormInstances($pdo, (int)$ctx['school_id'], $classId);
+    $forms = RibaReport::classFormInstances($pdo, (int)$ctx['school_id'], $campaignId, $classId);
     $distRows = [];
     foreach ($forms as $aud => $formId) {
         $dist = RibaReport::distributionForForm($pdo, (int)$formId);
@@ -1208,10 +1314,23 @@ if (preg_match('#^/f/([a-f0-9]{32})$#', $path, $m) && $method === 'GET') {
     $pdo = Db::pdo();
 
     $stmt = $pdo->prepare('
-        SELECT fi.id AS form_id, fi.audience, fi.status, c.name AS class_name, s.school_type
+        SELECT
+          fi.id AS form_id,
+          fi.school_id,
+          fi.class_id,
+          fi.campaign_id,
+          fi.audience,
+          fi.status,
+          c.name AS class_name,
+          s.school_type,
+          camp.status AS campaign_status,
+          camp.starts_at,
+          camp.ends_at,
+          camp.response_quota
         FROM form_instances fi
         JOIN classes c ON c.id = fi.class_id
         JOIN schools s ON s.id = fi.school_id
+        JOIN campaigns camp ON camp.id = fi.campaign_id
         WHERE fi.public_id = :pid
         LIMIT 1
     ');
@@ -1223,6 +1342,30 @@ if (preg_match('#^/f/([a-f0-9]{32})$#', $path, $m) && $method === 'GET') {
     }
     if ((string)$row['status'] !== 'active') {
         Http::forbidden("Bu anket kapalı.\n");
+        exit;
+    }
+    if ((string)$row['campaign_status'] !== 'active') {
+        Http::forbidden("Anket dönemi aktif değil.\n");
+        exit;
+    }
+
+    // Tarih aralığı / kota kontrolü
+    $campaignId = (int)$row['campaign_id'];
+    $used = campaignUsage($pdo, $campaignId);
+    $quota = (int)$row['response_quota'];
+
+    if (!campaignIsWithinWindow($row)) {
+        // Bitiş geçtiyse otomatik kapat
+        $end = strtotime((string)$row['ends_at']);
+        if ($end !== false && time() > $end) {
+            closeCampaign($pdo, (int)$row['school_id'], $campaignId);
+        }
+        Http::forbidden("Anket dönemi şu an açık değil (tarih aralığı dışında).\n");
+        exit;
+    }
+    if ($quota > 0 && $used >= $quota) {
+        closeCampaign($pdo, (int)$row['school_id'], $campaignId);
+        Http::forbidden("Anket kotası doldu. Ek kota/paket almanız gerekir.\n");
         exit;
     }
 
@@ -1288,7 +1431,14 @@ if (preg_match('#^/f/([a-f0-9]{32})$#', $path, $m) && $method === 'POST') {
 
     $pdo = Db::pdo();
     $stmt = $pdo->prepare('
-        SELECT fi.id AS form_id, fi.school_id, fi.class_id, fi.audience, fi.status, s.school_type
+        SELECT
+          fi.id AS form_id,
+          fi.school_id,
+          fi.class_id,
+          fi.campaign_id,
+          fi.audience,
+          fi.status,
+          s.school_type
         FROM form_instances fi
         JOIN schools s ON s.id = fi.school_id
         WHERE fi.public_id = :pid
@@ -1336,23 +1486,66 @@ if (preg_match('#^/f/([a-f0-9]{32})$#', $path, $m) && $method === 'POST') {
         $choices[$i] = $v;
     }
 
-    // Tek doldurma: IP hash kontrolü (kesin değil; çerez/IP ile “engellemeye çalışma”)
-    $iphash = ipHash($publicId);
-    $exists = $pdo->prepare('SELECT id FROM responses WHERE form_instance_id = :fid AND ip_hash = :ip LIMIT 1');
-    $exists->execute([':fid' => (int)$row['form_id'], ':ip' => $iphash]);
-    if ($exists->fetch()) {
-        Http::forbidden("Bu ağdan daha önce yanıt gönderilmiş görünüyor.\n");
+    $campaignId = (int)$row['campaign_id'];
+    if ($campaignId <= 0) {
+        Http::text(500, "Anket dönemi bilgisi eksik.\n");
         exit;
     }
 
     $pdo->beginTransaction();
     try {
+        // Anket dönemi: aktif mi / tarih aralığı / kota (FOR UPDATE ile yarış engellenir)
+        $campStmt = $pdo->prepare('SELECT id, school_id, status, starts_at, ends_at, response_quota FROM campaigns WHERE id = :id FOR UPDATE');
+        $campStmt->execute([':id' => $campaignId]);
+        $camp = $campStmt->fetch();
+        if (!$camp || (int)$camp['school_id'] !== (int)$row['school_id']) {
+            $pdo->rollBack();
+            Http::forbidden("Anket dönemi geçersiz.\n");
+            exit;
+        }
+        if ((string)$camp['status'] !== 'active') {
+            $pdo->rollBack();
+            Http::forbidden("Anket dönemi aktif değil.\n");
+            exit;
+        }
+        if (!campaignIsWithinWindow($camp)) {
+            // Bitiş geçtiyse otomatik kapat
+            $end = strtotime((string)$camp['ends_at']);
+            if ($end !== false && time() > $end) {
+                closeCampaign($pdo, (int)$row['school_id'], $campaignId);
+                $pdo->commit();
+            } else {
+                $pdo->rollBack();
+            }
+            Http::forbidden("Anket dönemi şu an açık değil (tarih aralığı dışında).\n");
+            exit;
+        }
+        $quota = (int)$camp['response_quota'];
+        $used = campaignUsage($pdo, $campaignId);
+        if ($quota > 0 && $used >= $quota) {
+            closeCampaign($pdo, (int)$row['school_id'], $campaignId);
+            $pdo->commit();
+            Http::forbidden("Anket kotası doldu. Ek kota/paket almanız gerekir.\n");
+            exit;
+        }
+
+        // Tek doldurma: IP hash kontrolü (kesin değil; çerez/IP ile “engellemeye çalışma”)
+        $iphash = ipHash($publicId);
+        $exists = $pdo->prepare('SELECT id FROM responses WHERE form_instance_id = :fid AND ip_hash = :ip LIMIT 1');
+        $exists->execute([':fid' => (int)$row['form_id'], ':ip' => $iphash]);
+        if ($exists->fetch()) {
+            $pdo->rollBack();
+            Http::forbidden("Bu ağdan daha önce yanıt gönderilmiş görünüyor.\n");
+            exit;
+        }
+
         $ins = $pdo->prepare('
-            INSERT INTO responses (school_id, class_id, form_instance_id, gender, ip_hash, user_agent)
-            VALUES (:sid, :cid, :fid, :g, :ip, :ua)
+            INSERT INTO responses (school_id, campaign_id, class_id, form_instance_id, gender, ip_hash, user_agent)
+            VALUES (:sid, :camp, :cid, :fid, :g, :ip, :ua)
         ');
         $ins->execute([
             ':sid' => (int)$row['school_id'],
+            ':camp' => $campaignId,
             ':cid' => (int)$row['class_id'],
             ':fid' => (int)$row['form_id'],
             ':g' => $gender,
@@ -1368,6 +1561,11 @@ if (preg_match('#^/f/([a-f0-9]{32})$#', $path, $m) && $method === 'POST') {
                 ':no' => (int)$no,
                 ':ch' => $ch,
             ]);
+        }
+
+        // Bu yanıt ile kota dolduysa dönemi kapat (hard stop)
+        if ($quota > 0 && ($used + 1) >= $quota) {
+            closeCampaign($pdo, (int)$row['school_id'], $campaignId);
         }
 
         $pdo->commit();
