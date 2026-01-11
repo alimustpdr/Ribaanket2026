@@ -1,0 +1,7 @@
+/.env
+/vendor/
+/storage/*.log
+/storage/cache/
+/storage/sessions/
+/storage/uploads/
+*.sqlite
