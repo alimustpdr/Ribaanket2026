@@ -284,7 +284,7 @@ if ($path === '/panel' && $method === 'GET') {
 <p><strong>Tür:</strong> {$type}</p>
 <ul>
   <li><a href="/panel/classes">Sınıflar</a></li>
-  <li><a href="/panel/campaigns">Yıllık Süreç (Kampanya)</a></li>
+  <li><a href="/panel/campaigns">Anket Dönemleri</a></li>
   <li><a href="/panel/reports">Raporlar</a></li>
 </ul>
 <form method="post" action="/logout">{$csrf}<button type="submit">Çıkış</button></form>
@@ -294,7 +294,7 @@ HTML);
 }
 
 // -------------------------
-// Okul Paneli: Kampanyalar (yıllık süreç)
+// Okul Paneli: Anket Dönemleri (yıllık süreç)
 // -------------------------
 if ($path === '/panel/campaigns' && $method === 'GET') {
     $ctx = requireSchoolAdmin();
@@ -333,16 +333,16 @@ if ($path === '/panel/campaigns' && $method === 'GET') {
     $defaultYear = (int)date('Y');
     $now = date('Y-m-d\\TH:i');
     $nextYear = date('Y-m-d\\TH:i', time() + 3600 * 24 * 365);
-    $html = View::layout('Kampanyalar', <<<HTML
-<h1>Yıllık Süreç (Kampanya)</h1>
+    $html = View::layout('Anket Dönemleri', <<<HTML
+<h1>Anket Dönemleri</h1>
 <p><strong>Okul:</strong> {$schoolName}</p>
-<p>Her yıl için ayrı kampanya oluşturulur. Linkler kampanya aktifken çalışır; kota bitince otomatik kapanır.</p>
+<p>Her yıl için ayrı anket dönemi oluşturulur. Linkler dönem aktifken çalışır; kota bitince otomatik kapanır.</p>
 <table border="1" cellpadding="6" cellspacing="0">
   <thead><tr><th>Yıl</th><th>Ad</th><th>Durum</th><th>Başlangıç</th><th>Bitiş</th><th>Kota</th><th></th></tr></thead>
   <tbody>{$items}</tbody>
 </table>
 <hr />
-<h2>Yeni kampanya oluştur</h2>
+<h2>Yeni anket dönemi oluştur</h2>
 <form method="post" action="/panel/campaigns/create">
   {$csrf}
   <p><label>Yıl<br /><input type="number" name="year" value="{$defaultYear}" required /></label></p>
@@ -388,7 +388,7 @@ if ($path === '/panel/campaigns/create' && $method === 'POST') {
             ':quota' => $quota,
         ]);
     } catch (\Throwable $e) {
-        Http::text(500, "Kampanya oluşturulamadı (aynı yıl zaten var olabilir).\n");
+        Http::text(500, "Anket dönemi oluşturulamadı (aynı yıl zaten var olabilir).\n");
         exit;
     }
     redirect('/panel/campaigns');
@@ -421,19 +421,39 @@ if (preg_match('#^/panel/campaigns/(\\d+)$#', $path, $m) && $method === 'GET') {
 
     $actions = '';
     if ((string)$camp['status'] === 'draft') {
-        $actions .= "<form method=\"post\" action=\"/panel/campaigns/{$campaignId}/activate\">{$csrf}<button type=\"submit\">Aktif et ve linkleri üret</button></form>";
+        $actions .= "<form method=\"post\" action=\"/panel/campaigns/{$campaignId}/activate\">{$csrf}<button type=\"submit\">Anket dönemini başlat (aktif et) ve linkleri üret</button></form>";
     } elseif ((string)$camp['status'] === 'active') {
-        $actions .= "<form method=\"post\" action=\"/panel/campaigns/{$campaignId}/close\">{$csrf}<button type=\"submit\">Kampanyayı kapat</button></form>";
+        $actions .= "<form method=\"post\" action=\"/panel/campaigns/{$campaignId}/close\">{$csrf}<button type=\"submit\">Anket dönemini kapat</button></form>";
     }
 
-    $html = View::layout('Kampanya Detayı', <<<HTML
-<h1>Kampanya</h1>
+    $editForm = '';
+    if ((string)$camp['status'] !== 'closed') {
+        // Not: datetime-local format
+        $startsVal = str_replace(' ', 'T', substr((string)$camp['starts_at'], 0, 16));
+        $endsVal = str_replace(' ', 'T', substr((string)$camp['ends_at'], 0, 16));
+        $quotaVal = (int)$camp['response_quota'];
+        $editForm = <<<HTML
+<hr />
+<h2>Dönem ayarlarını güncelle</h2>
+<form method="post" action="/panel/campaigns/{$campaignId}/update">
+  {$csrf}
+  <p><label>Başlangıç<br /><input type="datetime-local" name="starts_at" value="{$startsVal}" required /></label></p>
+  <p><label>Bitiş<br /><input type="datetime-local" name="ends_at" value="{$endsVal}" required /></label></p>
+  <p><label>Kota<br /><input type="number" name="response_quota" value="{$quotaVal}" required /></label></p>
+  <p><button type="submit">Güncelle</button></p>
+</form>
+HTML;
+    }
+
+    $html = View::layout('Anket Dönemi', <<<HTML
+<h1>Anket Dönemi</h1>
 <p><strong>Ad:</strong> {$name}</p>
 <p><strong>Durum:</strong> {$status}</p>
 <p><strong>Başlangıç:</strong> {$startsAt}</p>
 <p><strong>Bitiş:</strong> {$endsAt}</p>
 <p><strong>Kota:</strong> {$quota} | <strong>Kullanım:</strong> {$used} | <strong>Kalan:</strong> {$remaining}</p>
 {$actions}
+{$editForm}
 <p><a href="/panel/campaigns">Geri</a></p>
 HTML);
     Http::html(200, $html);
@@ -448,7 +468,7 @@ if (preg_match('#^/panel/campaigns/(\\d+)/activate$#', $path, $m) && $method ===
 
     $pdo->beginTransaction();
     try {
-        // Kampanya doğrula
+        // Anket dönemi doğrula
         $campStmt = $pdo->prepare('SELECT id, status, starts_at, ends_at FROM campaigns WHERE id = :id AND school_id = :sid LIMIT 1');
         $campStmt->execute([':id' => $campaignId, ':sid' => $ctx['school_id']]);
         $camp = $campStmt->fetch();
@@ -459,15 +479,15 @@ if (preg_match('#^/panel/campaigns/(\\d+)/activate$#', $path, $m) && $method ===
         }
         if ((string)$camp['status'] !== 'draft') {
             $pdo->rollBack();
-            Http::badRequest("Sadece taslak kampanya aktif edilebilir.\n");
+            Http::badRequest("Sadece taslak anket dönemi başlatılabilir.\n");
             exit;
         }
 
-        // Aynı okulda aktif başka kampanya varsa kapat (yıllık süreçlerin karışmaması için)
+        // Aynı okulda aktif başka anket dönemi varsa kapat (yıllık süreçlerin karışmaması için)
         $pdo->prepare('UPDATE campaigns SET status = :closed, closed_at = NOW() WHERE school_id = :sid AND status = :active')
             ->execute([':closed' => 'closed', ':sid' => $ctx['school_id'], ':active' => 'active']);
 
-        // Bu kampanyayı aktif et
+        // Bu anket dönemini aktif et
         $pdo->prepare('UPDATE campaigns SET status = :st, activated_at = NOW() WHERE id = :id')
             ->execute([':st' => 'active', ':id' => $campaignId]);
 
@@ -501,7 +521,7 @@ if (preg_match('#^/panel/campaigns/(\\d+)/activate$#', $path, $m) && $method ===
         $pdo->commit();
     } catch (\Throwable $e) {
         $pdo->rollBack();
-        Http::text(500, "Kampanya aktif edilemedi.\n");
+        Http::text(500, "Anket dönemi başlatılamadı.\n");
         exit;
     }
 
@@ -526,7 +546,7 @@ if (preg_match('#^/panel/campaigns/(\\d+)/close$#', $path, $m) && $method === 'P
         }
         if ((string)$camp['status'] !== 'active') {
             $pdo->rollBack();
-            Http::badRequest("Sadece aktif kampanya kapatılabilir.\n");
+            Http::badRequest("Sadece aktif anket dönemi kapatılabilir.\n");
             exit;
         }
 
@@ -538,10 +558,38 @@ if (preg_match('#^/panel/campaigns/(\\d+)/close$#', $path, $m) && $method === 'P
         $pdo->commit();
     } catch (\Throwable $e) {
         $pdo->rollBack();
-        Http::text(500, "Kampanya kapatılamadı.\n");
+        Http::text(500, "Anket dönemi kapatılamadı.\n");
         exit;
     }
 
+    redirect('/panel/campaigns/' . $campaignId);
+}
+
+if (preg_match('#^/panel/campaigns/(\\d+)/update$#', $path, $m) && $method === 'POST') {
+    $ctx = requireSchoolAdmin();
+    Csrf::validatePost();
+    $campaignId = (int)$m[1];
+    $startsAt = (string)($_POST['starts_at'] ?? '');
+    $endsAt = (string)($_POST['ends_at'] ?? '');
+    $quota = (int)($_POST['response_quota'] ?? 0);
+    if ($startsAt === '' || $endsAt === '' || $quota <= 0) {
+        Http::badRequest("Eksik/yanlış bilgi.\n");
+        exit;
+    }
+    $pdo = Db::pdo();
+    $stmt = $pdo->prepare('
+        UPDATE campaigns
+        SET starts_at = :starts_at, ends_at = :ends_at, response_quota = :quota
+        WHERE id = :id AND school_id = :sid AND status != :closed
+    ');
+    $stmt->execute([
+        ':starts_at' => str_replace('T', ' ', $startsAt) . ':00',
+        ':ends_at' => str_replace('T', ' ', $endsAt) . ':00',
+        ':quota' => $quota,
+        ':id' => $campaignId,
+        ':sid' => $ctx['school_id'],
+        ':closed' => 'closed',
+    ]);
     redirect('/panel/campaigns/' . $campaignId);
 }
 
@@ -804,9 +852,9 @@ if ($path === '/panel/classes' && $method === 'GET') {
     $activeCamp = activeCampaign($pdo, (int)$ctx['school_id']);
     $campNote = '';
     if (!$activeCamp) {
-        $campNote = '<p><strong>Uyarı:</strong> Aktif kampanya yok. Anket linkleri üretmek için önce <a href="/panel/campaigns">kampanyayı</a> aktif edin.</p>';
+        $campNote = '<p><strong>Uyarı:</strong> Aktif anket dönemi yok. Link üretmek için önce <a href="/panel/campaigns">anket dönemini</a> başlatın.</p>';
     } else {
-        $campNote = '<p><strong>Aktif kampanya:</strong> ' . View::e((string)$activeCamp['name']) . ' (' . View::e((string)$activeCamp['year']) . ')</p>';
+        $campNote = '<p><strong>Aktif anket dönemi:</strong> ' . View::e((string)$activeCamp['name']) . ' (' . View::e((string)$activeCamp['year']) . ')</p>';
     }
 
     $rows = $pdo->prepare('SELECT id, name, created_at FROM classes WHERE school_id = :sid ORDER BY created_at DESC');
@@ -889,7 +937,7 @@ if (preg_match('#^/panel/classes/(\\d+)$#', $path, $m) && $method === 'GET') {
         $html = View::layout('Anket Linkleri', <<<HTML
 <h1>Anket Linkleri</h1>
 <p><strong>Sınıf:</strong> {$cname}</p>
-<p><strong>Uyarı:</strong> Aktif kampanya yok. Link üretmek için <a href="/panel/campaigns">kampanyayı</a> aktif edin.</p>
+<p><strong>Uyarı:</strong> Aktif anket dönemi yok. Link üretmek için <a href="/panel/campaigns">anket dönemini</a> başlatın.</p>
 <p><a href="/panel/classes">Geri</a></p>
 HTML);
         Http::html(200, $html);
@@ -933,7 +981,7 @@ HTML);
     $html = View::layout('Anket Linkleri', <<<HTML
 <h1>Anket Linkleri</h1>
 <p><strong>Sınıf:</strong> {$cname}</p>
-<p><strong>Kampanya:</strong> {$campName}</p>
+<p><strong>Anket dönemi:</strong> {$campName}</p>
 <table border="1" cellpadding="6" cellspacing="0">
   <thead><tr><th>Hedef kitle</th><th>Link</th><th>Kopyala</th></tr></thead>
   <tbody>{$rows}</tbody>
