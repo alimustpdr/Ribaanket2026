@@ -9,6 +9,7 @@ use App\Db;
 use App\View;
 use App\RibaReport;
 use App\XlsxExport;
+use App\Mailer;
 
 $path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
 $method = strtoupper($_SERVER['REQUEST_METHOD'] ?? 'GET');
@@ -121,6 +122,50 @@ function closeCampaign(\PDO $pdo, int $schoolId, int $campaignId): void {
         ->execute([':st' => 'closed', ':id' => $campaignId, ':sid' => $schoolId]);
     $pdo->prepare('UPDATE form_instances SET status = :st WHERE campaign_id = :cid AND school_id = :sid')
         ->execute([':st' => 'closed', ':cid' => $campaignId, ':sid' => $schoolId]);
+}
+
+/**
+ * Kota dolduğu için kapanış bildirimi: kampanya başına sadece bir kez mail gönder.
+ * @return bool true => mail gönderilmeli
+ */
+function markQuotaClosedNotified(\PDO $pdo, int $schoolId, int $campaignId): bool {
+    $stmt = $pdo->prepare('
+        UPDATE campaigns
+        SET quota_closed_notified_at = NOW()
+        WHERE id = :id AND school_id = :sid AND quota_closed_notified_at IS NULL
+    ');
+    $stmt->execute([':id' => $campaignId, ':sid' => $schoolId]);
+    return $stmt->rowCount() === 1;
+}
+
+function notifyQuotaClosed(\PDO $pdo, int $schoolId, int $campaignId): void {
+    $schoolStmt = $pdo->prepare('SELECT name FROM schools WHERE id = :id LIMIT 1');
+    $schoolStmt->execute([':id' => $schoolId]);
+    $schoolName = (string)($schoolStmt->fetch()['name'] ?? 'Okul');
+
+    $campStmt = $pdo->prepare('SELECT year, name FROM campaigns WHERE id = :id AND school_id = :sid LIMIT 1');
+    $campStmt->execute([':id' => $campaignId, ':sid' => $schoolId]);
+    $camp = $campStmt->fetch();
+    $campLabel = $camp ? ((string)$camp['year'] . ' - ' . (string)$camp['name']) : 'Anket Dönemi';
+
+    $adminsStmt = $pdo->prepare('SELECT email FROM school_admins WHERE school_id = :sid');
+    $adminsStmt->execute([':sid' => $schoolId]);
+    $emails = array_map(static fn($r) => (string)$r['email'], $adminsStmt->fetchAll());
+
+    $subject = 'RİBA: Anket kotası doldu ve anket kapandı';
+    $body = "Merhaba,\n\n";
+    $body .= "Okul: {$schoolName}\n";
+    $body .= "Anket dönemi: {$campLabel}\n\n";
+    $body .= "Bu anket dönemi için tanımlı kota dolduğu için anket linkleri kapatıldı.\n";
+    $body .= "Devam etmek için:\n";
+    $body .= "- Panel > Anket Dönemleri > ilgili dönem\n";
+    $body .= "- Kota/paket artırın\n";
+    $body .= "- 'Anket dönemini yeniden başlat' butonuna basın\n\n";
+    $body .= "Bu e-posta otomatik bildirimdir.\n";
+
+    foreach ($emails as $to) {
+        Mailer::send($to, $subject, $body);
+    }
 }
 
 function campaignIsWithinWindow(array $camp): bool {
@@ -468,10 +513,12 @@ if (preg_match('#^/panel/campaigns/(\\d+)$#', $path, $m) && $method === 'GET') {
         $actions .= "<form method=\"post\" action=\"/panel/campaigns/{$campaignId}/activate\">{$csrf}<button type=\"submit\">Anket dönemini başlat (aktif et) ve linkleri üret</button></form>";
     } elseif ((string)$camp['status'] === 'active') {
         $actions .= "<form method=\"post\" action=\"/panel/campaigns/{$campaignId}/close\">{$csrf}<button type=\"submit\">Anket dönemini kapat</button></form>";
+    } elseif ((string)$camp['status'] === 'closed') {
+        $actions .= "<form method=\"post\" action=\"/panel/campaigns/{$campaignId}/reopen\">{$csrf}<button type=\"submit\">Anket dönemini yeniden başlat</button></form>";
     }
 
     $editForm = '';
-    if ((string)$camp['status'] !== 'closed') {
+    if (true) {
         // Not: datetime-local format
         $startsVal = str_replace(' ', 'T', substr((string)$camp['starts_at'], 0, 16));
         $endsVal = str_replace(' ', 'T', substr((string)$camp['ends_at'], 0, 16));
@@ -624,7 +671,7 @@ if (preg_match('#^/panel/campaigns/(\\d+)/update$#', $path, $m) && $method === '
     $stmt = $pdo->prepare('
         UPDATE campaigns
         SET starts_at = :starts_at, ends_at = :ends_at, response_quota = :quota
-        WHERE id = :id AND school_id = :sid AND status != :closed
+        WHERE id = :id AND school_id = :sid
     ');
     $stmt->execute([
         ':starts_at' => str_replace('T', ' ', $startsAt) . ':00',
@@ -632,8 +679,64 @@ if (preg_match('#^/panel/campaigns/(\\d+)/update$#', $path, $m) && $method === '
         ':quota' => $quota,
         ':id' => $campaignId,
         ':sid' => $ctx['school_id'],
-        ':closed' => 'closed',
     ]);
+    redirect('/panel/campaigns/' . $campaignId);
+}
+
+if (preg_match('#^/panel/campaigns/(\\d+)/reopen$#', $path, $m) && $method === 'POST') {
+    $ctx = requireSchoolAdmin();
+    Csrf::validatePost();
+    $campaignId = (int)$m[1];
+    $pdo = Db::pdo();
+
+    $pdo->beginTransaction();
+    try {
+        $campStmt = $pdo->prepare('SELECT id, school_id, status, starts_at, ends_at, response_quota FROM campaigns WHERE id = :id FOR UPDATE');
+        $campStmt->execute([':id' => $campaignId]);
+        $camp = $campStmt->fetch();
+        if (!$camp || (int)$camp['school_id'] !== (int)$ctx['school_id']) {
+            $pdo->rollBack();
+            Http::notFound();
+            exit;
+        }
+        if ((string)$camp['status'] !== 'closed') {
+            $pdo->rollBack();
+            Http::badRequest("Sadece kapalı anket dönemi yeniden başlatılabilir.\n");
+            exit;
+        }
+        if (!campaignIsWithinWindow($camp)) {
+            $pdo->rollBack();
+            Http::forbidden("Anket dönemi tarih aralığı dışında. Önce başlangıç/bitiş tarihini güncelleyin.\n");
+            exit;
+        }
+
+        $quota = (int)$camp['response_quota'];
+        $used = campaignUsage($pdo, $campaignId);
+        if ($quota > 0 && $used >= $quota) {
+            $pdo->rollBack();
+            Http::forbidden("Kota hâlâ dolu. Önce kotayı artırın, sonra yeniden başlatın.\n");
+            exit;
+        }
+
+        // Aynı okulda aktif başka dönem varsa kapat
+        $pdo->prepare('UPDATE campaigns SET status = :closed, closed_at = NOW() WHERE school_id = :sid AND status = :active')
+            ->execute([':closed' => 'closed', ':sid' => $ctx['school_id'], ':active' => 'active']);
+
+        // Bu dönemi aktif et
+        $pdo->prepare('UPDATE campaigns SET status = :st, activated_at = NOW() WHERE id = :id')
+            ->execute([':st' => 'active', ':id' => $campaignId]);
+
+        // Linkleri tekrar aç
+        $pdo->prepare('UPDATE form_instances SET status = :st WHERE campaign_id = :cid AND school_id = :sid')
+            ->execute([':st' => 'active', ':cid' => $campaignId, ':sid' => $ctx['school_id']]);
+
+        $pdo->commit();
+    } catch (\\Throwable $e) {
+        $pdo->rollBack();
+        Http::text(500, "Anket dönemi yeniden başlatılamadı.\n");
+        exit;
+    }
+
     redirect('/panel/campaigns/' . $campaignId);
 }
 
@@ -1365,7 +1468,11 @@ if (preg_match('#^/f/([a-f0-9]{32})$#', $path, $m) && $method === 'GET') {
     }
     if ($quota > 0 && $used >= $quota) {
         closeCampaign($pdo, (int)$row['school_id'], $campaignId);
+        $shouldMail = markQuotaClosedNotified($pdo, (int)$row['school_id'], $campaignId);
         Http::forbidden("Anket kotası doldu. Ek kota/paket almanız gerekir.\n");
+        if ($shouldMail) {
+            notifyQuotaClosed($pdo, (int)$row['school_id'], $campaignId);
+        }
         exit;
     }
 
@@ -1524,8 +1631,12 @@ if (preg_match('#^/f/([a-f0-9]{32})$#', $path, $m) && $method === 'POST') {
         $used = campaignUsage($pdo, $campaignId);
         if ($quota > 0 && $used >= $quota) {
             closeCampaign($pdo, (int)$row['school_id'], $campaignId);
+            $shouldMail = markQuotaClosedNotified($pdo, (int)$row['school_id'], $campaignId);
             $pdo->commit();
             Http::forbidden("Anket kotası doldu. Ek kota/paket almanız gerekir.\n");
+            if ($shouldMail) {
+                notifyQuotaClosed($pdo, (int)$row['school_id'], $campaignId);
+            }
             exit;
         }
 
@@ -1566,6 +1677,8 @@ if (preg_match('#^/f/([a-f0-9]{32})$#', $path, $m) && $method === 'POST') {
         // Bu yanıt ile kota dolduysa dönemi kapat (hard stop)
         if ($quota > 0 && ($used + 1) >= $quota) {
             closeCampaign($pdo, (int)$row['school_id'], $campaignId);
+            // Tek seferlik bildirim için işaretle (mail commit sonrası)
+            $shouldMail = markQuotaClosedNotified($pdo, (int)$row['school_id'], $campaignId);
         }
 
         $pdo->commit();
@@ -1589,6 +1702,11 @@ if (preg_match('#^/f/([a-f0-9]{32})$#', $path, $m) && $method === 'POST') {
 <p>Yanıtınız kaydedildi.</p>
 HTML);
     Http::html(200, $html);
+
+    // Kota bu yanıtta dolduysa (ve işaretlendiyse) mail gönder
+    if (isset($shouldMail) && $shouldMail === true) {
+        notifyQuotaClosed($pdo, (int)$row['school_id'], $campaignId);
+    }
     exit;
 }
 

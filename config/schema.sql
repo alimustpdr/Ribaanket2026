@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS campaigns (
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   activated_at DATETIME NULL,
   closed_at DATETIME NULL,
+  quota_closed_notified_at DATETIME NULL,
   PRIMARY KEY (id),
   UNIQUE KEY uq_campaign_school_year (school_id, year),
   INDEX idx_campaign_school (school_id),

@@ -8,6 +8,7 @@ require __DIR__ . '/view.php';
 require __DIR__ . '/csrf.php';
 require __DIR__ . '/riba_report.php';
 require __DIR__ . '/xlsx_export.php';
+require __DIR__ . '/mailer.php';
 
 // Basit hata görünürlüğü (prod ortamda kapatılacak; şimdilik kurulum aşaması)
 ini_set('display_errors', '1');
