@@ -24,6 +24,28 @@ function redirect(string $to): void {
     exit;
 }
 
+function appRoot(): string {
+    return dirname(__DIR__);
+}
+
+function isInstalled(): bool {
+    $root = appRoot();
+    // Kurulum tamamlandı kilidi
+    if (is_file($root . '/storage/installed.lock')) {
+        return true;
+    }
+    // Alternatif: .env varsa kurulmuş say
+    if (is_file($root . '/.env')) {
+        return true;
+    }
+    return false;
+}
+
+// Kurulum yapılmadıysa: /setup dışındaki sayfalarda yönlendir
+if (!isInstalled() && !in_array($path, ['/', '/setup', '/health'], true)) {
+    redirect('/setup');
+}
+
 function requireSchoolAdmin(): array {
     if (!isset($_SESSION['school_admin_id'], $_SESSION['school_id'])) {
         redirect('/login');
@@ -222,9 +244,199 @@ function listActiveQuotaPackages(\PDO $pdo): array {
     return $pdo->query('SELECT id, name, quota_add, price_amount, price_currency FROM quota_packages WHERE active = 1 ORDER BY quota_add ASC')->fetchAll();
 }
 
+function generateAppKey(): string {
+    return bin2hex(random_bytes(32));
+}
+
+/**
+ * Çok basit SQL çalıştırıcı (schema.sql için yeterli).
+ * Not: Bu projedeki schema dosyaları; string içinde ';' kullanmıyor.
+ */
+function runSqlFile(\PDO $pdo, string $absPath): void {
+    if (!is_file($absPath) || !is_readable($absPath)) {
+        throw new \RuntimeException("SQL dosyası okunamadı: {$absPath}");
+    }
+    $sql = file_get_contents($absPath);
+    if (!is_string($sql)) {
+        throw new \RuntimeException("SQL dosyası okunamadı: {$absPath}");
+    }
+
+    // Yorum satırlarını ayıkla
+    $lines = preg_split('/\\r\\n|\\r|\\n/', $sql);
+    $clean = [];
+    foreach ($lines as $line) {
+        $t = ltrim($line);
+        if ($t === '' || str_starts_with($t, '--')) {
+            continue;
+        }
+        $clean[] = $line;
+    }
+    $sql2 = implode("\n", $clean);
+
+    // Basit ';' split
+    $parts = array_filter(array_map('trim', explode(';', $sql2)), static fn($p) => $p !== '');
+    foreach ($parts as $stmt) {
+        $pdo->exec($stmt);
+    }
+}
+
+// -------------------------
+// Kurulum sihirbazı (/setup)
+// -------------------------
+if ($path === '/setup' && $method === 'GET') {
+    if (isInstalled()) {
+        Http::forbidden("Kurulum zaten yapılmış.\n");
+        exit;
+    }
+    $csrf = Csrf::input();
+    $appKey = generateAppKey();
+
+    // Paket şablonu (kullanıcı isterse değiştirir)
+    $packagesDefault = "500 Kişilik Paket|500||TRY\n1000 Kişilik Paket|1000||TRY";
+
+    $html = View::layout('Kurulum', <<<HTML
+<h1>Kurulum Sihirbazı</h1>
+<p>Bu sihirbaz:</p>
+<ul>
+  <li><code>.env</code> dosyasını yazar</li>
+  <li>Veritabanında <code>config/schema.sql</code> şemasını oluşturur</li>
+  <li>İlk paketleri ekler</li>
+</ul>
+<p><strong>Önemli:</strong> Sitenin Document Root'u <code>public/</code> olmalıdır.</p>
+<form method="post" action="/setup">
+  {$csrf}
+  <h2>Uygulama</h2>
+  <p><label>APP_KEY<br /><input name="APP_KEY" value="{$appKey}" required style="width: 100%;" /></label></p>
+  <h2>Site yöneticisi (siz)</h2>
+  <p><label>ADMIN_EMAIL<br /><input type="email" name="ADMIN_EMAIL" required /></label></p>
+  <p><label>ADMIN_PASSWORD<br /><input type="password" name="ADMIN_PASSWORD" required /></label></p>
+  <h2>MariaDB</h2>
+  <p><label>DB_HOST<br /><input name="DB_HOST" value="127.0.0.1" required /></label></p>
+  <p><label>DB_PORT<br /><input name="DB_PORT" value="3306" required /></label></p>
+  <p><label>DB_NAME<br /><input name="DB_NAME" required /></label></p>
+  <p><label>DB_USER<br /><input name="DB_USER" required /></label></p>
+  <p><label>DB_PASS<br /><input type="password" name="DB_PASS" /></label></p>
+  <h2>E-posta</h2>
+  <p><label>MAIL_FROM<br /><input name="MAIL_FROM" value="no-reply@example.com" required /></label></p>
+  <p><label>MAIL_FROM_NAME<br /><input name="MAIL_FROM_NAME" value="RIBA" required /></label></p>
+  <h2>İlk paketler (zorunlu)</h2>
+  <p>Her satır: <code>Ad|Kota|Fiyat(opsiyonel)|ParaBirimi(opsiyonel)</code></p>
+  <p><textarea name="PACKAGES" rows="6" style="width: 100%;">{$packagesDefault}</textarea></p>
+  <p><button type="submit">Kurulumu tamamla</button></p>
+</form>
+HTML);
+    Http::html(200, $html);
+    exit;
+}
+
+if ($path === '/setup' && $method === 'POST') {
+    if (isInstalled()) {
+        Http::forbidden("Kurulum zaten yapılmış.\n");
+        exit;
+    }
+    Csrf::validatePost();
+
+    $APP_KEY = trim((string)($_POST['APP_KEY'] ?? ''));
+    $ADMIN_EMAIL = trim((string)($_POST['ADMIN_EMAIL'] ?? ''));
+    $ADMIN_PASSWORD = (string)($_POST['ADMIN_PASSWORD'] ?? '');
+
+    $DB_HOST = trim((string)($_POST['DB_HOST'] ?? ''));
+    $DB_PORT = trim((string)($_POST['DB_PORT'] ?? '3306'));
+    $DB_NAME = trim((string)($_POST['DB_NAME'] ?? ''));
+    $DB_USER = trim((string)($_POST['DB_USER'] ?? ''));
+    $DB_PASS = (string)($_POST['DB_PASS'] ?? '');
+
+    $MAIL_FROM = trim((string)($_POST['MAIL_FROM'] ?? ''));
+    $MAIL_FROM_NAME = trim((string)($_POST['MAIL_FROM_NAME'] ?? ''));
+
+    $PACKAGES = (string)($_POST['PACKAGES'] ?? '');
+
+    if ($APP_KEY === '' || $ADMIN_EMAIL === '' || $ADMIN_PASSWORD === '' || $DB_HOST === '' || $DB_PORT === '' || $DB_NAME === '' || $DB_USER === '' || $MAIL_FROM === '' || $MAIL_FROM_NAME === '') {
+        Http::badRequest("Eksik bilgi.\n");
+        exit;
+    }
+
+    $root = appRoot();
+
+    // DB bağlantı testi
+    try {
+        $dsn = "mysql:host={$DB_HOST};port={$DB_PORT};dbname={$DB_NAME};charset=utf8mb4";
+        $pdo = new \PDO($dsn, $DB_USER, $DB_PASS, [
+            \PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION,
+            \PDO::ATTR_DEFAULT_FETCH_MODE => \PDO::FETCH_ASSOC,
+            \PDO::ATTR_EMULATE_PREPARES => false,
+        ]);
+    } catch (\Throwable $e) {
+        Http::text(500, "Veritabanına bağlanılamadı. DB bilgilerini kontrol edin.\n");
+        exit;
+    }
+
+    // Şema
+    try {
+        runSqlFile($pdo, $root . '/config/schema.sql');
+    } catch (\Throwable $e) {
+        Http::text(500, "Şema kurulamadı: " . $e->getMessage() . "\n");
+        exit;
+    }
+
+    // Paketler (zorunlu)
+    $pkgLines = array_filter(array_map('trim', preg_split('/\\r\\n|\\r|\\n/', $PACKAGES) ?: []), static fn($l) => $l !== '');
+    if (count($pkgLines) === 0) {
+        Http::badRequest("En az 1 paket girmelisiniz.\n");
+        exit;
+    }
+    $insPkg = $pdo->prepare('INSERT INTO quota_packages (name, quota_add, price_amount, price_currency, active) VALUES (:n, :q, :p, :c, 1)');
+    foreach ($pkgLines as $line) {
+        $parts = array_map('trim', explode('|', $line));
+        $name = $parts[0] ?? '';
+        $quotaAdd = isset($parts[1]) ? (int)$parts[1] : 0;
+        $priceAmount = (isset($parts[2]) && $parts[2] !== '') ? (int)$parts[2] : null;
+        $priceCurrency = (isset($parts[3]) && $parts[3] !== '') ? strtoupper($parts[3]) : null;
+        if ($name === '' || $quotaAdd <= 0) {
+            Http::badRequest("Paket satırı hatalı: {$line}\n");
+            exit;
+        }
+        $insPkg->execute([':n' => $name, ':q' => $quotaAdd, ':p' => $priceAmount, ':c' => $priceCurrency]);
+    }
+
+    // .env yaz
+    $env = "APP_ENV=prod\n";
+    $env .= "APP_KEY={$APP_KEY}\n\n";
+    $env .= "ADMIN_EMAIL={$ADMIN_EMAIL}\n";
+    $env .= "ADMIN_PASSWORD={$ADMIN_PASSWORD}\n\n";
+    $env .= "MAIL_FROM={$MAIL_FROM}\n";
+    $env .= "MAIL_FROM_NAME={$MAIL_FROM_NAME}\n\n";
+    $env .= "DB_HOST={$DB_HOST}\n";
+    $env .= "DB_PORT={$DB_PORT}\n";
+    $env .= "DB_NAME={$DB_NAME}\n";
+    $env .= "DB_USER={$DB_USER}\n";
+    $env .= "DB_PASS={$DB_PASS}\n";
+
+    $envPath = $root . '/.env';
+    if (@file_put_contents($envPath, $env) === false) {
+        Http::text(500, ".env yazılamadı. Dosya izinlerini kontrol edin.\n");
+        exit;
+    }
+    @chmod($envPath, 0600);
+
+    // Kurulum kilidi
+    $lockDir = $root . '/storage';
+    if (!is_dir($lockDir)) {
+        @mkdir($lockDir, 0777, true);
+    }
+    @file_put_contents($lockDir . '/installed.lock', date('c'));
+
+    redirect('/admin/login');
+}
+
 if ($path === '/' && $method === 'GET') {
+    $setupLink = '';
+    if (!isInstalled()) {
+        $setupLink = '<p><strong>Kurulum gerekli:</strong> <a href="/setup">/setup</a></p>';
+    }
     $html = View::layout('RİBA', <<<HTML
 <h1>RİBA Sistemi</h1>
+{$setupLink}
 <ul>
   <li><a href="/apply">Okul başvurusu</a></li>
   <li><a href="/login">Okul paneli girişi</a></li>
