@@ -130,3 +130,44 @@ CREATE TABLE IF NOT EXISTS response_answers (
     FOREIGN KEY (response_id) REFERENCES responses(id)
     ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Ek kota paketleri (satış)
+CREATE TABLE IF NOT EXISTS quota_packages (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  name VARCHAR(255) NOT NULL,
+  quota_add INT UNSIGNED NOT NULL,
+  price_amount INT UNSIGNED NULL,
+  price_currency VARCHAR(3) NULL,
+  active TINYINT(1) NOT NULL DEFAULT 1,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  INDEX idx_quota_packages_active (active)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Ek kota siparişleri (okul açar; admin onaylar/işler)
+CREATE TABLE IF NOT EXISTS quota_orders (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  school_id BIGINT UNSIGNED NOT NULL,
+  campaign_id BIGINT UNSIGNED NOT NULL,
+  package_id BIGINT UNSIGNED NOT NULL,
+  method ENUM('online','manual') NOT NULL,
+  status ENUM('pending','paid','cancelled') NOT NULL DEFAULT 'pending',
+  quota_add INT UNSIGNED NOT NULL,
+  note VARCHAR(255) NULL,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  paid_at DATETIME NULL,
+  applied_at DATETIME NULL,
+  PRIMARY KEY (id),
+  INDEX idx_quota_orders_school (school_id),
+  INDEX idx_quota_orders_campaign (campaign_id),
+  INDEX idx_quota_orders_status (status),
+  CONSTRAINT fk_quota_orders_school
+    FOREIGN KEY (school_id) REFERENCES schools(id)
+    ON DELETE CASCADE,
+  CONSTRAINT fk_quota_orders_campaign
+    FOREIGN KEY (campaign_id) REFERENCES campaigns(id)
+    ON DELETE CASCADE,
+  CONSTRAINT fk_quota_orders_package
+    FOREIGN KEY (package_id) REFERENCES quota_packages(id)
+    ON DELETE RESTRICT
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

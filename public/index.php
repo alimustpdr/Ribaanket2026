@@ -191,6 +191,20 @@ function campaignQuota(array $camp): int {
     return (int)($camp['response_quota'] ?? 0);
 }
 
+function schoolQuotaSummary(\PDO $pdo, int $campaignId): array {
+    $used = campaignUsage($pdo, $campaignId);
+    $campStmt = $pdo->prepare('SELECT response_quota, status, starts_at, ends_at FROM campaigns WHERE id = :id LIMIT 1');
+    $campStmt->execute([':id' => $campaignId]);
+    $camp = $campStmt->fetch();
+    $quota = $camp ? (int)$camp['response_quota'] : 0;
+    $remaining = max(0, $quota - $used);
+    return ['used' => $used, 'quota' => $quota, 'remaining' => $remaining, 'status' => $camp ? (string)$camp['status'] : ''];
+}
+
+function listActiveQuotaPackages(\PDO $pdo): array {
+    return $pdo->query('SELECT id, name, quota_add, price_amount, price_currency FROM quota_packages WHERE active = 1 ORDER BY quota_add ASC')->fetchAll();
+}
+
 if ($path === '/' && $method === 'GET') {
     $html = View::layout('RİBA', <<<HTML
 <h1>RİBA Sistemi</h1>
@@ -545,6 +559,8 @@ HTML;
 <p><strong>Kota:</strong> {$quota} | <strong>Kullanım:</strong> {$used} | <strong>Kalan:</strong> {$remaining}</p>
 {$actions}
 {$editForm}
+<hr />
+<p><a href="/panel/quota?campaign_id={$campaignId}">Ek kota satın al / talep et</a></p>
 <p><a href="/panel/campaigns">Geri</a></p>
 HTML);
     Http::html(200, $html);
@@ -738,6 +754,123 @@ if (preg_match('#^/panel/campaigns/(\\d+)/reopen$#', $path, $m) && $method === '
     }
 
     redirect('/panel/campaigns/' . $campaignId);
+}
+
+// -------------------------
+// Okul Paneli: Ek kota (paket satın alma / talep)
+// -------------------------
+if ($path === '/panel/quota' && $method === 'GET') {
+    $ctx = requireSchoolAdmin();
+    $pdo = Db::pdo();
+
+    $campaignId = isset($_GET['campaign_id']) ? (int)$_GET['campaign_id'] : 0;
+    if ($campaignId <= 0) {
+        Http::badRequest("campaign_id gerekli.\n");
+        exit;
+    }
+    $camp = getCampaignById($pdo, (int)$ctx['school_id'], $campaignId);
+    if (!$camp) {
+        Http::notFound();
+        exit;
+    }
+    $campName = View::e((string)$camp['name']);
+    $campYear = View::e((string)$camp['year']);
+
+    $sum = schoolQuotaSummary($pdo, $campaignId);
+    $csrf = Csrf::input();
+    $packages = listActiveQuotaPackages($pdo);
+
+    $pkgOptions = '';
+    foreach ($packages as $p) {
+        $id = (int)$p['id'];
+        $label = (string)$p['name'] . ' (+'. (int)$p['quota_add'] . ' yanıt)';
+        if (!empty($p['price_amount']) && !empty($p['price_currency'])) {
+            $label .= ' - ' . (int)$p['price_amount'] . ' ' . (string)$p['price_currency'];
+        }
+        $pkgOptions .= '<option value="' . $id . '">' . View::e($label) . '</option>';
+    }
+
+    $note = '<p><strong>Not:</strong> Online ödeme altyapısı (iyzico/paytr vb.) entegrasyonu yapılmadan, “online” siparişin otomatik “ödendi” sayılması mümkün değildir. Şu an sipariş oluşturulur; ödeme/tahsilat sonrası ya siz (site yöneticisi) onaylarsınız ya da ileride ödeme entegrasyonu ile otomatikleşir.</p>';
+
+    $html = View::layout('Ek Kota', <<<HTML
+<h1>Ek Kota</h1>
+<p><strong>Anket dönemi:</strong> {$campYear} - {$campName}</p>
+<p><strong>Kota:</strong> {$sum['quota']} | <strong>Kullanım:</strong> {$sum['used']} | <strong>Kalan:</strong> {$sum['remaining']}</p>
+{$note}
+<form method="post" action="/panel/quota/order">
+  {$csrf}
+  <input type="hidden" name="campaign_id" value="{$campaignId}" />
+  <p><label>Paket<br />
+    <select name="package_id" required>
+      {$pkgOptions}
+    </select>
+  </label></p>
+  <p><label>Yöntem<br />
+    <select name="method" required>
+      <option value="online">Online (kullanıcı kendi alır)</option>
+      <option value="manual">Nakit / yönetici tanımlasın</option>
+    </select>
+  </label></p>
+  <p><label>Not (opsiyonel)<br /><input name="note" /></label></p>
+  <p><button type="submit">Sipariş oluştur</button></p>
+</form>
+<p><a href="/panel/campaigns/{$campaignId}">Geri</a></p>
+HTML);
+    Http::html(200, $html);
+    exit;
+}
+
+if ($path === '/panel/quota/order' && $method === 'POST') {
+    $ctx = requireSchoolAdmin();
+    Csrf::validatePost();
+    $pdo = Db::pdo();
+
+    $campaignId = (int)($_POST['campaign_id'] ?? 0);
+    $packageId = (int)($_POST['package_id'] ?? 0);
+    $methodVal = (string)($_POST['method'] ?? '');
+    $note = trim((string)($_POST['note'] ?? ''));
+
+    if ($campaignId <= 0 || $packageId <= 0 || ($methodVal !== 'online' && $methodVal !== 'manual')) {
+        Http::badRequest("Eksik/yanlış bilgi.\n");
+        exit;
+    }
+    $camp = getCampaignById($pdo, (int)$ctx['school_id'], $campaignId);
+    if (!$camp) {
+        Http::notFound();
+        exit;
+    }
+
+    $pkgStmt = $pdo->prepare('SELECT id, quota_add, active FROM quota_packages WHERE id = :id LIMIT 1');
+    $pkgStmt->execute([':id' => $packageId]);
+    $pkg = $pkgStmt->fetch();
+    if (!$pkg || (int)$pkg['active'] !== 1) {
+        Http::badRequest("Paket bulunamadı/aktif değil.\n");
+        exit;
+    }
+    $quotaAdd = (int)$pkg['quota_add'];
+
+    $stmt = $pdo->prepare('
+        INSERT INTO quota_orders (school_id, campaign_id, package_id, method, status, quota_add, note)
+        VALUES (:sid, :cid, :pid, :m, :st, :qa, :note)
+    ');
+    $stmt->execute([
+        ':sid' => (int)$ctx['school_id'],
+        ':cid' => $campaignId,
+        ':pid' => $packageId,
+        ':m' => $methodVal,
+        ':st' => 'pending',
+        ':qa' => $quotaAdd,
+        ':note' => ($note === '' ? null : $note),
+    ]);
+
+    $html = View::layout('Sipariş alındı', <<<HTML
+<h1>Ek kota siparişi oluşturuldu</h1>
+<p>Siparişiniz kaydedildi. Ödeme/tahsilat sonrası kota “anında” sisteme yansıtılır.</p>
+<p>Not: Anket dönemi otomatik açılmaz; kota artırıldıktan sonra <strong>Anket Dönemleri</strong> ekranından “yeniden başlat” butonuna basmalısınız.</p>
+<p><a href="/panel/campaigns/{$campaignId}">Anket dönemine dön</a></p>
+HTML);
+    Http::html(200, $html);
+    exit;
 }
 
 // -------------------------
@@ -1806,6 +1939,160 @@ if ($path === '/admin/schools/approve' && $method === 'POST') {
     $stmt = $pdo->prepare('UPDATE schools SET status = :status, activated_at = NOW() WHERE id = :id AND status = :pending');
     $stmt->execute([':status' => 'active', ':id' => $id, ':pending' => 'pending']);
     redirect('/admin/schools');
+}
+
+// -------------------------
+// Site yöneticisi: Paketler ve Ek Kota Siparişleri
+// -------------------------
+if ($path === '/admin/packages' && $method === 'GET') {
+    requireSiteAdmin();
+    $pdo = Db::pdo();
+    $rows = $pdo->query('SELECT id, name, quota_add, price_amount, price_currency, active, created_at FROM quota_packages ORDER BY quota_add ASC')->fetchAll();
+    $csrf = Csrf::input();
+
+    $items = '';
+    foreach ($rows as $r) {
+        $items .= '<tr>';
+        $items .= '<td>' . View::e((string)$r['id']) . '</td>';
+        $items .= '<td>' . View::e((string)$r['name']) . '</td>';
+        $items .= '<td>' . View::e((string)$r['quota_add']) . '</td>';
+        $items .= '<td>' . View::e((string)($r['price_amount'] ?? '')) . ' ' . View::e((string)($r['price_currency'] ?? '')) . '</td>';
+        $items .= '<td>' . ((int)$r['active'] === 1 ? 'aktif' : 'pasif') . '</td>';
+        $items .= '<td>' . View::e((string)$r['created_at']) . '</td>';
+        $items .= '</tr>';
+    }
+
+    $html = View::layout('Paketler', <<<HTML
+<h1>Ek Kota Paketleri</h1>
+<table border="1" cellpadding="6" cellspacing="0">
+  <thead><tr><th>ID</th><th>Ad</th><th>Kota</th><th>Fiyat</th><th>Durum</th><th>Oluşturma</th></tr></thead>
+  <tbody>{$items}</tbody>
+</table>
+<hr />
+<h2>Yeni paket</h2>
+<form method="post" action="/admin/packages/create">
+  {$csrf}
+  <p><label>Ad<br /><input name="name" required /></label></p>
+  <p><label>Kota artışı (yanıt)<br /><input type="number" name="quota_add" required /></label></p>
+  <p><label>Fiyat (opsiyonel)<br /><input type="number" name="price_amount" /></label></p>
+  <p><label>Para birimi (opsiyonel, örn TRY)<br /><input name="price_currency" /></label></p>
+  <p><button type="submit">Ekle</button></p>
+</form>
+<p><a href="/">Ana sayfa</a></p>
+HTML);
+    Http::html(200, $html);
+    exit;
+}
+
+if ($path === '/admin/packages/create' && $method === 'POST') {
+    requireSiteAdmin();
+    Csrf::validatePost();
+    $pdo = Db::pdo();
+    $name = trim((string)($_POST['name'] ?? ''));
+    $quotaAdd = (int)($_POST['quota_add'] ?? 0);
+    $priceAmount = isset($_POST['price_amount']) && $_POST['price_amount'] !== '' ? (int)$_POST['price_amount'] : null;
+    $priceCurrency = isset($_POST['price_currency']) && trim((string)$_POST['price_currency']) !== '' ? strtoupper(trim((string)$_POST['price_currency'])) : null;
+    if ($name === '' || $quotaAdd <= 0) {
+        Http::badRequest("Eksik/yanlış bilgi.\n");
+        exit;
+    }
+    $stmt = $pdo->prepare('INSERT INTO quota_packages (name, quota_add, price_amount, price_currency, active) VALUES (:n, :q, :p, :c, 1)');
+    $stmt->execute([':n' => $name, ':q' => $quotaAdd, ':p' => $priceAmount, ':c' => $priceCurrency]);
+    redirect('/admin/packages');
+}
+
+if ($path === '/admin/orders' && $method === 'GET') {
+    requireSiteAdmin();
+    $pdo = Db::pdo();
+    $rows = $pdo->query('
+        SELECT o.id, o.status, o.method, o.quota_add, o.note, o.created_at,
+               s.name AS school_name,
+               c.year AS camp_year, c.name AS camp_name,
+               p.name AS pkg_name
+        FROM quota_orders o
+        JOIN schools s ON s.id = o.school_id
+        JOIN campaigns c ON c.id = o.campaign_id
+        JOIN quota_packages p ON p.id = o.package_id
+        ORDER BY o.created_at DESC
+        LIMIT 200
+    ')->fetchAll();
+    $csrf = Csrf::input();
+    $items = '';
+    foreach ($rows as $r) {
+        $id = (int)$r['id'];
+        $items .= '<tr>';
+        $items .= '<td>' . View::e((string)$id) . '</td>';
+        $items .= '<td>' . View::e((string)$r['school_name']) . '</td>';
+        $items .= '<td>' . View::e((string)$r['camp_year']) . ' - ' . View::e((string)$r['camp_name']) . '</td>';
+        $items .= '<td>' . View::e((string)$r['pkg_name']) . ' (+' . View::e((string)$r['quota_add']) . ')</td>';
+        $items .= '<td>' . View::e((string)$r['method']) . '</td>';
+        $items .= '<td>' . View::e((string)$r['status']) . '</td>';
+        $items .= '<td>' . View::e((string)($r['note'] ?? '')) . '</td>';
+        $items .= '<td>' . View::e((string)$r['created_at']) . '</td>';
+        $items .= '<td>';
+        if ((string)$r['status'] === 'pending') {
+            $items .= "<form method=\"post\" action=\"/admin/orders/mark-paid\" style=\"margin:0\">{$csrf}<input type=\"hidden\" name=\"id\" value=\"{$id}\" /><button type=\"submit\">Ödendi (kota ekle)</button></form>";
+        }
+        $items .= '</td>';
+        $items .= '</tr>';
+    }
+
+    $html = View::layout('Siparişler', <<<HTML
+<h1>Ek Kota Siparişleri</h1>
+<p><a href="/admin/packages">Paketler</a></p>
+<table border="1" cellpadding="6" cellspacing="0">
+  <thead><tr><th>ID</th><th>Okul</th><th>Dönem</th><th>Paket</th><th>Yöntem</th><th>Durum</th><th>Not</th><th>Oluşturma</th><th>İşlem</th></tr></thead>
+  <tbody>{$items}</tbody>
+</table>
+<p><a href="/">Ana sayfa</a></p>
+HTML);
+    Http::html(200, $html);
+    exit;
+}
+
+if ($path === '/admin/orders/mark-paid' && $method === 'POST') {
+    requireSiteAdmin();
+    Csrf::validatePost();
+    $pdo = Db::pdo();
+    $id = (int)($_POST['id'] ?? 0);
+    if ($id <= 0) {
+        Http::badRequest("Geçersiz sipariş.\n");
+        exit;
+    }
+
+    $pdo->beginTransaction();
+    try {
+        $stmt = $pdo->prepare('SELECT * FROM quota_orders WHERE id = :id FOR UPDATE');
+        $stmt->execute([':id' => $id]);
+        $order = $stmt->fetch();
+        if (!$order || (string)$order['status'] !== 'pending') {
+            $pdo->rollBack();
+            Http::badRequest("Sipariş bulunamadı veya zaten işlenmiş.\n");
+            exit;
+        }
+        $campaignId = (int)$order['campaign_id'];
+        $quotaAdd = (int)$order['quota_add'];
+
+        // Siparişi paid yap
+        $pdo->prepare('UPDATE quota_orders SET status = :st, paid_at = NOW() WHERE id = :id')
+            ->execute([':st' => 'paid', ':id' => $id]);
+
+        // Kampanya kotasını artır
+        $pdo->prepare('UPDATE campaigns SET response_quota = response_quota + :qa WHERE id = :cid')
+            ->execute([':qa' => $quotaAdd, ':cid' => $campaignId]);
+
+        // applied_at
+        $pdo->prepare('UPDATE quota_orders SET applied_at = NOW() WHERE id = :id')
+            ->execute([':id' => $id]);
+
+        $pdo->commit();
+    } catch (\Throwable $e) {
+        $pdo->rollBack();
+        Http::text(500, "Sipariş işlenemedi.\n");
+        exit;
+    }
+
+    redirect('/admin/orders');
 }
 
 Http::notFound();
