@@ -120,5 +120,16 @@ PDF dosyaları `storage/pdfs/` klasöründe saklanır ve güvenli şekilde servi
 
 ---
 
+## 🔗 Hızlı Linkler
+
+- **Webhook Detaylı Rehber:** [WEBHOOK_DETAYLI_REHBER.md](WEBHOOK_DETAYLI_REHBER.md) - Otomatik deploy testi ve sorun giderme
+- **AA Panel Git Manager:** [AA_PANEL_GIT_MANAGER.md](AA_PANEL_GIT_MANAGER.md) - Git Manager kullanımı
+- **Hızlı Başlangıç:** [DEPLOY_HIZLI_BASLANGIC.md](DEPLOY_HIZLI_BASLANGIC.md)
+
+---
+
+   
+   <!-- Webhook Test: 2026-01-12 -->
+
 **Versiyon:** 1.0  
 **Son Güncelleme:** 2026
