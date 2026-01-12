@@ -2046,7 +2046,7 @@ if (preg_match('#^/pdf/([a-z0-9_\\-]+)$#', $path, $m) && $method === 'GET') {
         exit;
     }
     $root = dirname(__DIR__);
-    $file = $root . '/' . $allowed[$key];
+    $file = $root . '/storage/pdfs/' . $allowed[$key];
     Http::sendFilePdf($file, $allowed[$key]);
     exit;
 }
