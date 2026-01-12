@@ -1,0 +1,76 @@
+# RİBA Anket Sistemi - OpenLiteSpeed 1.8.4 Yapılandırması
+# AA Panel için optimize edilmiş
+
+# Tüm istekleri index.php'ye yönlendir (SPA benzeri routing)
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteBase /
+    
+    # Health check endpoint'i için özel kural
+    RewriteRule ^health$ index.php [L]
+    
+    # Mevcut dosyalar ve klasörler için direkt erişim
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteCond %{REQUEST_FILENAME} !-d
+    
+    # Tüm diğer istekleri index.php'ye yönlendir
+    RewriteRule ^(.*)$ index.php [QSA,L]
+</IfModule>
+
+# Güvenlik başlıkları (OpenLiteSpeed mod_headers desteği)
+<IfModule mod_headers.c>
+    # XSS koruması
+    Header set X-XSS-Protection "1; mode=block"
+    
+    # Clickjacking koruması
+    Header set X-Frame-Options "SAMEORIGIN"
+    
+    # MIME type sniffing koruması
+    Header set X-Content-Type-Options "nosniff"
+    
+    # Referrer Policy
+    Header set Referrer-Policy "strict-origin-when-cross-origin"
+    
+    # Content Security Policy (gerekirse özelleştirilebilir)
+    # Header set Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline';"
+</IfModule>
+
+# PHP ayarları (OpenLiteSpeed Web Admin Console'dan da yapılabilir)
+# Not: OpenLiteSpeed'de PHP ayarları genellikle Web Admin Console üzerinden yapılır
+# Ancak .htaccess ile de override edilebilir (eğer AllowOverride All ise)
+<IfModule mod_lsphp.c>
+    # Bu ayarlar OpenLiteSpeed Web Admin Console'da da yapılmalı
+    # php_admin_value upload_max_filesize 10M
+    # php_admin_value post_max_size 10M
+    # php_admin_value max_execution_time 300
+    # php_admin_value max_input_time 300
+    # php_admin_value memory_limit 256M
+</IfModule>
+
+# Gzip sıkıştırma (OpenLiteSpeed'de genellikle otomatik aktif)
+<IfModule mod_deflate.c>
+    AddOutputFilterByType DEFLATE text/html text/plain text/xml text/css text/javascript application/javascript application/json
+</IfModule>
+
+# Önbellekleme (statik dosyalar için)
+<IfModule mod_expires.c>
+    ExpiresActive On
+    ExpiresByType image/jpeg "access plus 1 year"
+    ExpiresByType image/png "access plus 1 year"
+    ExpiresByType image/gif "access plus 1 year"
+    ExpiresByType application/pdf "access plus 1 month"
+    ExpiresByType text/css "access plus 1 month"
+    ExpiresByType application/javascript "access plus 1 month"
+</IfModule>
+
+# Hassas dosyaları koru
+<FilesMatch "\.(env|log|sql|md)$">
+    Order allow,deny
+    Deny from all
+</FilesMatch>
+
+# .htaccess dosyasını gizle
+<Files .htaccess>
+    Order allow,deny
+    Deny from all
+</Files>

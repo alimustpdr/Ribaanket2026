@@ -1,7 +1,51 @@
-/.env
+# RİBA Anket Sistemi - .gitignore
+
+# Ortam değişkenleri
+.env
+.env.*
+!.env.example
+config/env
+
+# Log dosyaları
+storage/logs/*.log
+storage/mail.log
+*.log
+
+# PDF dosyaları (storage/pdfs'de saklanır, git'e commit edilmez)
+storage/pdfs/*.pdf
+
+# Yedek dosyalar
+*.sql
+*.tar.gz
+*.zip
+backup/
+
+# IDE dosyaları
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS dosyaları
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Composer
 /vendor/
-/storage/*.log
-/storage/cache/
-/storage/sessions/
-/storage/uploads/
-*.sqlite
+composer.lock
+
+# Node modules (eğer varsa)
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Geçici dosyalar
+*.tmp
+*.temp
+storage/installed.lock
+
+# Excel çıktı dosyaları (geçici)
+*.xlsx
+!riba_light_report_output.xlsx
